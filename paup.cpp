@@ -19,6 +19,8 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 #define XCB_MOD_MASK_SHIFT   1
 #define XCB_MOD_MASK_LOCK    2
@@ -29,7 +31,7 @@
 #define XCB_MOD_MASK_4       64  // Super/Win
 #define XCB_MOD_MASK_5       128
 
-using namespace std;
+								   using namespace std;
 
 static bool g_debug = false;
 
@@ -173,6 +175,7 @@ using namespace xcl;
 auto con = Connection({"WM_STATE", "WM_NAME", "_NET_ACTIVE_WINDOW"});
 uint32_t background, foreground, foreground_muted, buffer;
 xcb_window_t subwin;
+static bool used_fallback = false; // new global
 
 int vol = 0;
 bool muted = false;
@@ -184,13 +187,33 @@ uint32_t col01;
 
 PulseClient pulsecl("paup");
 
+// Fetch current window geometry (width, height)
+bool get_window_size(xcb_connection_t *conn, xcb_window_t win, uint16_t &w, uint16_t &h)
+{
+	xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(conn, win);
+	xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(conn, geom_cookie, NULL);
+	if (geom) {
+		w = geom->width;
+		h = geom->height;
+		free(geom);
+		return true;
+	} else {
+		w = 40;
+		h = 130;
+		return false;
+	}
+}
+
 void draw()
 {
 	const auto conhandle = con.handle();
-	const uint16_t wheight = 130;
-	uint16_t pme = (int)(((float)wheight / 100) * (float)vol);
-	xcb_rectangle_t fg_rects = {0, (int16_t)(wheight - pme), 100, (uint16_t)(pme)};
-	xcb_rectangle_t bg_rects = {0, 0, 1024, 1024};
+	uint16_t win_width = 40, win_height = 130;
+	get_window_size(conhandle, subwin, win_width, win_height);
+
+	uint16_t pme = static_cast<uint16_t>(((float)win_height / 100.0f) * (float)vol);
+
+	xcb_rectangle_t fg_rects = {0, static_cast<int16_t>(win_height - pme), win_width, pme};
+	xcb_rectangle_t bg_rects = {0, 0, win_width, win_height};
 
 	xcb_poly_fill_rectangle(conhandle, buffer, background, 1, &bg_rects);
 	if (muted) {
@@ -199,9 +222,9 @@ void draw()
 		xcb_poly_fill_rectangle(conhandle, buffer, foreground, 1, &fg_rects);
 	}
 	xcb_flush(conhandle);
-	xcb_copy_area(conhandle, buffer, subwin, foreground, 0, 0, 0, 0, 200, wheight);
+	xcb_copy_area(conhandle, buffer, subwin, foreground, 0, 0, 0, 0, win_width, win_height);
 	xcb_flush(conhandle);
-	debugf("Redrew, vol=%d muted=%d\n", vol, muted);
+	debugf("Redrew, vol=%d muted=%d size=%ux%u\n", vol, muted, win_width, win_height);
 }
 
 uint32_t get_colorpixel(uint16_t r, uint16_t g, uint16_t b)
@@ -225,6 +248,27 @@ uint32_t get_colorpixel(uint16_t r, uint16_t g, uint16_t b)
 
 	return pixel;
 }
+
+// --- New code for deferring the initial draw only if fallback is used ---
+void wait_for_valid_window_size_and_draw()
+{
+	const auto conhandle = con.handle();
+	if (used_fallback) {
+		const int max_attempts = 40; // wait up to ~200ms total (40 x 5ms)
+		int attempts = 0;
+		uint16_t w = 0, h = 0;
+		while (attempts < max_attempts) {
+			bool ok = get_window_size(conhandle, subwin, w, h);
+			if (ok && w > 1 && h > 1 && !(w == 40 && h == 130)) break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(3));
+			xcb_flush(conhandle);
+			attempts++;
+		}
+		debugf("Window size detected after %d attempts: %ux%u\n", attempts, w, h);
+	}
+	draw();
+}
+// --- End new code ---
 
 void init(int argc, char **argv)
 {
@@ -254,28 +298,16 @@ void init(int argc, char **argv)
 	xcb_window_t overlay_parent = parent;
 	xcb_window_t window_id = xcb_generate_id(conhandle);
 
-	xcb_generic_error_t *err = xcb_request_check(conhandle, xcb_create_window_checked(
-		conhandle,
-		(uint8_t)XCB_COPY_FROM_PARENT,
-		window_id,
-		overlay_parent,
-		(int16_t)20, (int16_t)20,
-		40, 130,
-		(uint16_t)0,
-		(uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT,
-		screen->root_visual,
-		XCB_CW_EVENT_MASK, &windowmask
-	));
+	xcb_generic_error_t *err = xcb_request_check(conhandle, xcb_create_window_checked(conhandle, (uint8_t)XCB_COPY_FROM_PARENT, window_id, overlay_parent, (int16_t)20, (int16_t)20, 40, 130, (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, XCB_CW_EVENT_MASK, &windowmask));
+	used_fallback = false;
 	if (err) {
 		debugf("Window creation failed with parent (focus): error_code=%d (falling back to root)\n", err->error_code);
 		free(err);
 
 		overlay_parent = screen->root;
 		window_id = xcb_generate_id(conhandle);
-		xcb_create_window(conhandle, (uint8_t)XCB_COPY_FROM_PARENT, window_id,
-						  overlay_parent, (int16_t)20, (int16_t)20, 40, 130,
-						  (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT,
-						  screen->root_visual, XCB_CW_EVENT_MASK, &windowmask);
+		xcb_create_window(conhandle, (uint8_t)XCB_COPY_FROM_PARENT, window_id, overlay_parent, (int16_t)20, (int16_t)20, 40, 130, (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, XCB_CW_EVENT_MASK, &windowmask);
+		used_fallback = true;
 	}
 	subwin = window_id;
 
@@ -321,7 +353,8 @@ void init(int argc, char **argv)
 	vol = device->Volume();
 	muted = device->Muted();
 
-	draw();
+	// Replace original draw() with wait_for_valid_window_size_and_draw()
+	wait_for_valid_window_size_and_draw();
 
 	xcb_generic_event_t *ev;
 	std::string logEvent = "";
