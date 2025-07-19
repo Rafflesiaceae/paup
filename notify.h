@@ -37,7 +37,7 @@ class CommandLineNotifier : public Notifier
 public:
 	virtual ~CommandLineNotifier() {}
 
-	virtual void Notify(enum NotificationType type, long value, bool) const
+	virtual void Notify(enum NotificationType type, long value, bool /*mute*/) const
 	{
 		switch (type) {
 			case NotificationType::VOLUME:

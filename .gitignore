@@ -1,3 +1,5 @@
 .cache
-paup
 compile_commands.json
+cycle.sh
+flatten.sh
+paup
