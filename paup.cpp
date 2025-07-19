@@ -74,7 +74,6 @@ protected:
 class Connection
 {
 public:
-	/* explicit operator xcb_connection_t*() const {return handle_;} */
 	vector<Window> windows;
 
 	Connection(map<string, xcb_atom_t> atoms);
@@ -83,7 +82,6 @@ public:
 	xcb_atom_t readAtom(string atom);
 	void grabKey(uint32_t cmodifier, uint32_t ckey);
 
-	// Accessors
 	xcb_connection_t *handle() const { return handle_; }
 	xcb_key_symbols_t *symbols() const { return symbols_; }
 	xcb_screen_t *screen() const { return screen_; }
@@ -157,19 +155,6 @@ inline Window newXCBSubWindow(Connection &con, uint16_t width, uint16_t height, 
 	const auto mask = XCB_CW_EVENT_MASK;
 	const uint32_t values[1] = {eventmask};
 	xcb_create_window(con.handle(), (uint8_t)XCB_COPY_FROM_PARENT, w.handle(), parent, (int16_t)20, (int16_t)20, width, height, (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT, con.screen()->root_visual, (uint32_t)mask, values);
-
-	return w;
-}
-
-inline Window newXCBWindow(Connection &con, uint16_t width, uint16_t height, uint32_t eventmask, xcb_window_t parent)
-{
-	auto w = Window(con);
-	w.width = width;
-	w.height = height;
-	const auto mask = XCB_CW_EVENT_MASK;
-	const uint32_t values[1] = {eventmask};
-	xcb_create_window(con.handle(), (uint8_t)XCB_COPY_FROM_PARENT, w.handle(), parent, (int16_t)20, (int16_t)20, width, height, (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT, con.screen()->root_visual, (uint32_t)mask, values);
-
 	return w;
 }
 
@@ -243,7 +228,6 @@ uint32_t get_colorpixel(uint16_t r, uint16_t g, uint16_t b)
 
 void init(int argc, char **argv)
 {
-	// Parse debug flag: -d or --debug
 	for (int i = 1; i < argc; ++i) {
 		if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
 			g_debug = true;
@@ -267,8 +251,33 @@ void init(int argc, char **argv)
 
 	uint32_t windowmask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_PROPERTY_CHANGE;
 
-	auto window = newXCBSubWindow(con, 40, 130, windowmask, parent);
-	subwin = window.handle();
+	xcb_window_t overlay_parent = parent;
+	xcb_window_t window_id = xcb_generate_id(conhandle);
+
+	xcb_generic_error_t *err = xcb_request_check(conhandle, xcb_create_window_checked(
+		conhandle,
+		(uint8_t)XCB_COPY_FROM_PARENT,
+		window_id,
+		overlay_parent,
+		(int16_t)20, (int16_t)20,
+		40, 130,
+		(uint16_t)0,
+		(uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT,
+		screen->root_visual,
+		XCB_CW_EVENT_MASK, &windowmask
+	));
+	if (err) {
+		debugf("Window creation failed with parent (focus): error_code=%d (falling back to root)\n", err->error_code);
+		free(err);
+
+		overlay_parent = screen->root;
+		window_id = xcb_generate_id(conhandle);
+		xcb_create_window(conhandle, (uint8_t)XCB_COPY_FROM_PARENT, window_id,
+						  overlay_parent, (int16_t)20, (int16_t)20, 40, 130,
+						  (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT,
+						  screen->root_visual, XCB_CW_EVENT_MASK, &windowmask);
+	}
+	subwin = window_id;
 
 	uint32_t values[2];
 	values[1] = 0;
@@ -283,11 +292,11 @@ void init(int argc, char **argv)
 	background = newGC(con, XCB_GC_FOREGROUND | XCB_GC_GRAPHICS_EXPOSURES, values);
 
 	buffer = xcb_generate_id(conhandle);
-	xcb_create_pixmap_checked(conhandle, screen->root_depth, buffer, window.handle(), 1024, 1024);
+	xcb_create_pixmap_checked(conhandle, screen->root_depth, buffer, subwin, 1024, 1024);
 
-	xcb_map_window(conhandle, window.handle());
+	xcb_map_window(conhandle, subwin);
 
-	xcb_set_input_focus(conhandle, XCB_INPUT_FOCUS_POINTER_ROOT, window.handle(), XCB_CURRENT_TIME);
+	xcb_set_input_focus(conhandle, XCB_INPUT_FOCUS_POINTER_ROOT, subwin, XCB_CURRENT_TIME);
 
 	const auto olo = (uint32_t)XCB_EVENT_MASK_PROPERTY_CHANGE;
 	xcb_change_window_attributes_checked(conhandle, screen->root, XCB_CW_EVENT_MASK, &olo);
@@ -328,10 +337,27 @@ void init(int argc, char **argv)
 		}
 
 		switch (ev->response_type & ~0x80) {
+			case 0:  // Error
+				{
+					auto err = (xcb_generic_error_t *)ev;
+					debugf("XCB ERROR: error_code=%u, sequence=%u, resource_id=%u, minor_code=%u, major_code=%u\n", err->error_code, err->sequence, err->resource_id, err->minor_code, err->major_code);
+
+					switch (err->error_code) {
+						case XCB_WINDOW: debugf("XCB error: BadWindow (invalid window parameter)\n"); break;
+						case XCB_MATCH: debugf("XCB error: BadMatch (parameter mismatch)\n"); break;
+						case XCB_DRAWABLE:
+							debugf("XCB error: BadDrawable (invalid drawable parameter)\n");
+							break;
+						default: break;
+					}
+					free(ev);
+					continue;
+					break;
+				}
 			case XCB_EXPOSE:
 				{
 					auto e = (xcb_expose_event_t *)(ev);
-					xcb_copy_area(conhandle, buffer, window.handle(), foreground, e->x, e->y, e->x, e->y, e->width, e->height);
+					xcb_copy_area(conhandle, buffer, subwin, foreground, e->x, e->y, e->x, e->y, e->width, e->height);
 					xcb_flush(conhandle);
 					debugf("XCB_EXPOSE\n");
 					break;
@@ -344,8 +370,15 @@ void init(int argc, char **argv)
 				{
 					auto e = (xcb_property_notify_event_t *)(ev);
 					if (e->atom == con.readAtom("_NET_ACTIVE_WINDOW")) {
-						debugf("Active Window was changed. Exiting.\n");
-						goto exit;
+						xcb_get_input_focus_cookie_t cookie = xcb_get_input_focus(con.handle());
+						xcb_get_input_focus_reply_t *reply = xcb_get_input_focus_reply(con.handle(), cookie, NULL);
+						if (reply && reply->focus != subwin) {
+							debugf("Active Window was changed AWAY from our overlay. Exiting.\n");
+							free(reply);
+							goto exit;
+						}
+						free(reply);
+						break;
 					}
 					break;
 				}
@@ -356,8 +389,8 @@ void init(int argc, char **argv)
 
 					bool shift_pressed = e->state & XCB_MOD_MASK_SHIFT;
 					bool ctrl_pressed = e->state & XCB_MOD_MASK_CONTROL;
-					bool alt_pressed = e->state & XCB_MOD_MASK_1;    // Usually "Alt"
-					bool super_pressed = e->state & XCB_MOD_MASK_4;  // Usually "Super"/Win
+					bool alt_pressed = e->state & XCB_MOD_MASK_1;
+					bool super_pressed = e->state & XCB_MOD_MASK_4;
 
 					const auto keysym = xcb_key_press_lookup_keysym(con.symbols(), e, 0);
 
@@ -406,9 +439,12 @@ void init(int argc, char **argv)
 			case XCB_MAP_NOTIFY:
 				debugf("XCB_MAP_NOTIFY received (window mapped)\n");
 				break;
+
 			default:
 				logEvent = "";
 				debugf("unhandled(");
+				debugf("%d:", ev->response_type & ~0x80);
+				debugf("%d;", ev->response_type);
 				if (auto resptypeStr = xcb_event_get_label(ev->response_type); resptypeStr != NULL)
 					debugf(std::string(resptypeStr));
 				else
