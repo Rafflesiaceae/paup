@@ -31,7 +31,7 @@
 #define XCB_MOD_MASK_4       64  // Super/Win
 #define XCB_MOD_MASK_5       128
 
-								   using namespace std;
+using namespace std;
 
 static bool g_debug = false;
 
@@ -175,7 +175,7 @@ using namespace xcl;
 auto con = Connection({"WM_STATE", "WM_NAME", "_NET_ACTIVE_WINDOW"});
 uint32_t background, foreground, foreground_muted, buffer;
 xcb_window_t subwin;
-static bool used_fallback = false; // new global
+static bool used_fallback = false;  // new global
 
 int vol = 0;
 bool muted = false;
@@ -254,7 +254,7 @@ void wait_for_valid_window_size_and_draw()
 {
 	const auto conhandle = con.handle();
 	if (used_fallback) {
-		const int max_attempts = 40; // wait up to ~200ms total (40 x 5ms)
+		const int max_attempts = 40;  // wait up to ~200ms total (40 x 5ms)
 		int attempts = 0;
 		uint16_t w = 0, h = 0;
 		while (attempts < max_attempts) {
