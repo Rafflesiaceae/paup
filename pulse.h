@@ -197,6 +197,8 @@ public:
 	// Get or set the volume of a device.
 	int GetVolume(const Device &device) const;
 	bool SetVolume(Device &device, long value);
+	bool SetVolumeAsync(Device &device, long value);
+	void Iterate(bool block = false);
 
 	// Convenience wrappers for adjusting volume
 	bool IncreaseVolume(Device &device, long increment);

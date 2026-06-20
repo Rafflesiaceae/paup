@@ -184,6 +184,11 @@ Device *device;
 ServerInfo defaults;
 const char *opt_device;
 uint32_t col01;
+uint16_t win_width = 40;
+uint16_t win_height = 130;
+bool redraw_pending = false;
+bool volume_sync_pending = false;
+long pending_volume = 0;
 
 PulseClient pulsecl("paup");
 
@@ -207,9 +212,6 @@ bool get_window_size(xcb_connection_t *conn, xcb_window_t win, uint16_t &w, uint
 void draw()
 {
 	const auto conhandle = con.handle();
-	uint16_t win_width = 40, win_height = 130;
-	get_window_size(conhandle, subwin, win_width, win_height);
-
 	uint16_t pme = static_cast<uint16_t>(((float)win_height / 100.0f) * (float)vol);
 
 	xcb_rectangle_t fg_rects = {0, static_cast<int16_t>(win_height - pme), win_width, pme};
@@ -225,6 +227,32 @@ void draw()
 	xcb_copy_area(conhandle, buffer, subwin, foreground, 0, 0, 0, 0, win_width, win_height);
 	xcb_flush(conhandle);
 	debugf("Redrew, vol=%d muted=%d size=%ux%u\n", vol, muted, win_width, win_height);
+	redraw_pending = false;
+}
+
+void request_draw()
+{
+	redraw_pending = true;
+}
+
+void request_volume_sync()
+{
+	pending_volume = vol;
+	volume_sync_pending = true;
+}
+
+void do_best_effort_work()
+{
+	if (volume_sync_pending) {
+		volume_sync_pending = false;
+		pulsecl.SetVolumeAsync(*device, pending_volume);
+	}
+
+	pulsecl.Iterate(0);
+
+	if (redraw_pending) {
+		draw();
+	}
 }
 
 uint32_t get_colorpixel(uint16_t r, uint16_t g, uint16_t b)
@@ -259,7 +287,11 @@ void wait_for_valid_window_size_and_draw()
 		uint16_t w = 0, h = 0;
 		while (attempts < max_attempts) {
 			bool ok = get_window_size(conhandle, subwin, w, h);
-			if (ok && w > 1 && h > 1 && !(w == 40 && h == 130)) break;
+			if (ok && w > 1 && h > 1 && !(w == 40 && h == 130)) {
+				win_width = w;
+				win_height = h;
+				break;
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(3));
 			xcb_flush(conhandle);
 			attempts++;
@@ -357,8 +389,10 @@ void init(int argc, char **argv)
 	wait_for_valid_window_size_and_draw();
 
 	xcb_generic_event_t *ev;
+	xcb_generic_event_t *queued_ev = nullptr;
 	std::string logEvent = "";
-	while ((ev = xcb_wait_for_event(conhandle))) {
+	while ((ev = queued_ev ? queued_ev : xcb_wait_for_event(conhandle))) {
+		queued_ev = nullptr;
 
 		{  // log event
 			logEvent = "[";
@@ -393,6 +427,15 @@ void init(int argc, char **argv)
 					xcb_copy_area(conhandle, buffer, subwin, foreground, e->x, e->y, e->x, e->y, e->width, e->height);
 					xcb_flush(conhandle);
 					debugf("XCB_EXPOSE\n");
+					break;
+				}
+			case XCB_CONFIGURE_NOTIFY:
+				{
+					auto e = (xcb_configure_notify_event_t *)(ev);
+					win_width = e->width;
+					win_height = e->height;
+					request_draw();
+					debugf("XCB_CONFIGURE_NOTIFY size=%ux%u\n", win_width, win_height);
 					break;
 				}
 			case XCB_FOCUS_IN:
@@ -433,21 +476,21 @@ void init(int argc, char **argv)
 						case 106:  // j or J
 							if (vol > 0) {
 								vol -= 1;
-								pulsecl.SetVolume(*device, vol);
-								draw();
+								request_volume_sync();
+								request_draw();
 							}
 							break;
 						case 107:  // k or K
 							if (vol < MAX_VOL) {
 								vol += 1;
-								pulsecl.SetVolume(*device, vol);
-								draw();
+								request_volume_sync();
+								request_draw();
 							}
 							break;
 						case 109:  // m or M
 							muted = !muted;
 							pulsecl.SetMute(*device, muted);
-							draw();
+							request_draw();
 							break;
 						case 113:        // q
 						case XK_Escape:  // Escape
@@ -467,7 +510,7 @@ void init(int argc, char **argv)
 				break;
 			case XCB_BUTTON_PRESS:
 				vol += 1;
-				draw();
+				request_draw();
 				break;
 			case XCB_MAP_NOTIFY:
 				debugf("XCB_MAP_NOTIFY received (window mapped)\n");
@@ -492,6 +535,10 @@ void init(int argc, char **argv)
 		}
 		if (ev != NULL) {
 			free(ev);
+		}
+		queued_ev = xcb_poll_for_queued_event(conhandle);
+		if (queued_ev == nullptr) {
+			do_best_effort_work();
 		}
 	}
 

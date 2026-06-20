@@ -277,6 +277,12 @@ void PulseClient::WaitOperationComplete(pa_operation *op)
 	pa_operation_unref(op);
 }
 
+void PulseClient::Iterate(bool block)
+{
+	int r;
+	pa_mainloop_iterate(mainloop_, block ? 1 : 0, &r);
+}
+
 template <class T>
 T *PulseClient::find_fuzzy(std::vector<T> &haystack, const std::string &needle)
 {
@@ -378,6 +384,24 @@ bool PulseClient::SetVolume(Device &device, long volume)
 	}
 
 	return success;
+}
+
+bool PulseClient::SetVolumeAsync(Device &device, long volume)
+{
+	if (device.ops_.SetVolume == nullptr) {
+		warnx("device does not support setting volume.");
+		return false;
+	}
+
+	volume = volume_range_.Clamp(volume);
+	const pa_cvolume *cvol = value_to_cvol(volume, &device.volume_);
+	pa_operation *op = device.ops_.SetVolume(context_, device.index_, cvol, nullptr, nullptr);
+	if (!op) return false;
+
+	device.update_volume(*cvol);
+	notifier_->Notify(NotificationType::VOLUME, device.volume_percent_, device.mute_);
+	pa_operation_unref(op);
+	return true;
 }
 
 bool PulseClient::IncreaseVolume(Device &device, long increment)
