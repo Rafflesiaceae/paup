@@ -183,7 +183,7 @@ const int MAX_VOL = 100;
 constexpr uint16_t POPUP_WIDTH = 40;
 constexpr uint16_t POPUP_HEIGHT = 130;
 constexpr uint16_t POPUP_MARGIN = 20;
-constexpr auto VOLUME_REPEAT_DELAY = std::chrono::milliseconds(250);
+constexpr auto VOLUME_REPEAT_DELAY = std::chrono::milliseconds(200);
 Device *device;
 ServerInfo defaults;
 const char *opt_device;
