@@ -1,10 +1,10 @@
 #include "pulse.h"
 
+#include "config.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define PAUP_VERSION "5"
 
 enum {
 	MIN_VOLUME = 0,
