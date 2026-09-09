@@ -19,10 +19,7 @@ configure_file(output: 'config.h', configuration: configuration)
 
 paup_dependencies = [
 	dependency('libpulse'),
-	dependency('x11'),
 	dependency('xcb'),
-	dependency('xcb-keysyms'),
-	dependency('xcb-util'),
 ]
 
 executable(

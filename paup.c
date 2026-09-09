@@ -1,13 +1,6 @@
-#define XK_LATIN1
-#define XK_MISCELLANY
-
 #include "pulse.h"
 
-#include <X11/keysymdef.h>
-#include <poll.h>
 #include <xcb/xcb.h>
-#include <xcb/xcb_keysyms.h>
-#include <xcb/xcb_util.h>
 
 #include <errno.h>
 #include <limits.h>
@@ -28,12 +21,15 @@ enum {
 	VOLUME_REPEAT_DELAY_MILLISECONDS = 200,
 	VOLUME_REPEAT_INTERVAL_MILLISECONDS = 10,
 	BUFFER_SIZE = 1024,
+	KEYSYM_ESCAPE = 0xff1b,
 };
 
 typedef struct {
 	xcb_connection_t *handle;
-	xcb_key_symbols_t *symbols;
 	xcb_screen_t *screen;
+	xcb_get_keyboard_mapping_reply_t *keyboard_mapping;
+	xcb_keycode_t minimum_keycode;
+	xcb_keycode_t maximum_keycode;
 } Connection;
 
 typedef struct {
@@ -72,6 +68,7 @@ typedef struct {
 	bool volume_sync_pending;
 	long pending_volume;
 	VolumeKeyHold volume_key_hold;
+	struct timespec startup_started_at;
 } App;
 
 typedef enum {
@@ -117,21 +114,20 @@ static bool connection_init(Connection *connection)
 		xcb_screen_next(&screens);
 	}
 	connection->screen = screens.data;
-	connection->symbols = xcb_key_symbols_alloc(connection->handle);
-	if (connection->screen == NULL || connection->symbols == NULL) {
-		debugf("Failed to initialize X11 screen or keyboard symbols\n");
+	if (connection->screen == NULL) {
+		debugf("Failed to initialize the X11 screen\n");
 		return false;
 	}
+	connection->minimum_keycode = setup->min_keycode;
+	connection->maximum_keycode = setup->max_keycode;
 
 	return true;
 }
 
 static void connection_cleanup(Connection *connection)
 {
-	if (connection->symbols != NULL) {
-		xcb_key_symbols_free(connection->symbols);
-		connection->symbols = NULL;
-	}
+	free(connection->keyboard_mapping);
+	connection->keyboard_mapping = NULL;
 	if (connection->handle != NULL) {
 		xcb_disconnect(connection->handle);
 		connection->handle = NULL;
@@ -161,49 +157,102 @@ static bool read_required_atoms(App *app)
 	xcb_intern_atom_cookie_t instance_cookie;
 	xcb_intern_atom_reply_t *active_reply;
 	xcb_intern_atom_reply_t *instance_reply;
+	xcb_get_keyboard_mapping_cookie_t keyboard_cookie;
+	xcb_get_keyboard_mapping_reply_t *keyboard_reply;
+	uint8_t keycode_count;
 
-	/* Submit both atom requests together so they share one X11 round trip. */
+	/* Submit atoms and the keymap together so they share one X11 round trip. */
 	active_cookie = xcb_intern_atom(connection->handle, false,
 		sizeof(active_window_name) - 1, active_window_name);
 	instance_cookie = xcb_intern_atom(connection->handle, false,
 		sizeof(instance_name) - 1, instance_name);
+	keycode_count = (uint8_t)(connection->maximum_keycode
+		- connection->minimum_keycode + 1);
+	keyboard_cookie = xcb_get_keyboard_mapping(connection->handle,
+		connection->minimum_keycode, keycode_count);
 	active_reply = xcb_intern_atom_reply(connection->handle,
 		active_cookie, NULL);
 	instance_reply = xcb_intern_atom_reply(connection->handle,
 		instance_cookie, NULL);
-	if (active_reply == NULL || instance_reply == NULL) {
-		debugf("Failed to read required X11 atoms\n");
+	keyboard_reply = xcb_get_keyboard_mapping_reply(connection->handle,
+		keyboard_cookie, NULL);
+	if (active_reply == NULL || instance_reply == NULL
+		|| keyboard_reply == NULL) {
+		debugf("Failed to read required X11 metadata\n");
 		free(active_reply);
 		free(instance_reply);
+		free(keyboard_reply);
 		return false;
 	}
 
 	app->active_window_atom = active_reply->atom;
 	app->instance_atom = instance_reply->atom;
+	connection->keyboard_mapping = keyboard_reply;
 	free(active_reply);
 	free(instance_reply);
 	return app->active_window_atom != XCB_ATOM_NONE
 		&& app->instance_atom != XCB_ATOM_NONE;
 }
 
+static xcb_keysym_t lookup_keysym(const Connection *connection,
+	xcb_keycode_t keycode)
+{
+	const xcb_keysym_t *keysyms;
+	size_t offset;
+
+	if (keycode < connection->minimum_keycode
+		|| keycode > connection->maximum_keycode) {
+		return XCB_NO_SYMBOL;
+	}
+
+	keysyms = xcb_get_keyboard_mapping_keysyms(
+		connection->keyboard_mapping);
+	offset = (size_t)(keycode - connection->minimum_keycode)
+		* connection->keyboard_mapping->keysyms_per_keycode;
+	return keysyms[offset];
+}
+
+static xcb_keycode_t lookup_keycode(const Connection *connection,
+	xcb_keysym_t requested_keysym)
+{
+	const xcb_keysym_t *keysyms = xcb_get_keyboard_mapping_keysyms(
+		connection->keyboard_mapping);
+	uint16_t keycode;
+	uint8_t column;
+
+	/* Search every keysym column, matching xcb-keysyms' lookup behavior. */
+	for (keycode = connection->minimum_keycode;
+		keycode <= connection->maximum_keycode; keycode++) {
+		size_t offset = (size_t)(keycode - connection->minimum_keycode)
+			* connection->keyboard_mapping->keysyms_per_keycode;
+
+		for (column = 0;
+			column < connection->keyboard_mapping->keysyms_per_keycode;
+			column++) {
+			if (keysyms[offset + column] == requested_keysym) {
+				return (xcb_keycode_t)keycode;
+			}
+		}
+	}
+	return XCB_NO_SYMBOL;
+}
+
 static void grab_key(Connection *connection, xcb_keysym_t keysym)
 {
-	xcb_keycode_t *keycodes;
+	xcb_keycode_t keycode;
 
-	keycodes = xcb_key_symbols_get_keycode(connection->symbols, keysym);
-	if (keycodes == NULL || keycodes[0] == XCB_NO_SYMBOL) {
+	keycode = lookup_keycode(connection, keysym);
+	if (keycode == XCB_NO_SYMBOL) {
 		debugf("No X11 keycode for keysym 0x%x\n", keysym);
-		free(keycodes);
 		return;
 	}
 
 	/* Grab failures are reported asynchronously with the other setup errors. */
 	xcb_grab_key(connection->handle, true,
-		connection->screen->root, 0, keycodes[0],
+		connection->screen->root, 0, keycode,
 		XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
 	debugf("Requested grab of keysym 0x%x as keycode %u\n",
-		keysym, keycodes[0]);
-	free(keycodes);
+		keysym, keycode);
 }
 
 static xcb_alloc_color_cookie_t request_color(Connection *connection,
@@ -420,6 +469,13 @@ static int compare_times(struct timespec left, struct timespec right)
 		return left.tv_nsec < right.tv_nsec ? -1 : 1;
 	}
 	return 0;
+}
+
+static double elapsed_milliseconds(struct timespec start, struct timespec end)
+{
+	int64_t nanoseconds = (int64_t)(end.tv_sec - start.tv_sec) * 1000000000LL;
+	nanoseconds += end.tv_nsec - start.tv_nsec;
+	return (double)nanoseconds / 1000000.0;
 }
 
 static void request_volume_sync(App *app)
@@ -679,21 +735,21 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 		}
 		case XCB_KEY_PRESS: {
 			xcb_key_press_event_t *press = (xcb_key_press_event_t *)event;
-			xcb_keysym_t keysym = xcb_key_press_lookup_keysym(
-				app->connection.symbols, press, 0);
+			xcb_keysym_t keysym = lookup_keysym(&app->connection,
+				press->detail);
 			bool control_pressed =
 				(press->state & XCB_MOD_MASK_CONTROL) != 0;
 
 			debugf("KEY_PRESS: keysym=%u state=0x%x\n", keysym,
 				press->state);
 			switch (keysym) {
-				case XK_j:
+				case 'j':
 					start_volume_hold(app, -1, press->detail);
 					break;
-				case XK_k:
+				case 'k':
 					start_volume_hold(app, 1, press->detail);
 					break;
-				case XK_m:
+				case 'm':
 					app->muted = !app->muted;
 					if (app->device_ready) {
 						pulse_client_set_mute(&app->pulse, &app->device,
@@ -704,7 +760,7 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					}
 					request_draw(app);
 					break;
-				case XK_s:
+				case 's':
 					/* Silence is terminal, so render its known final state. */
 					app->volume_key_hold = (VolumeKeyHold){0};
 					app->muted = true;
@@ -718,7 +774,7 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					pulse_client_set_mute(&app->pulse, &app->device, true);
 					show_exit_feedback(app);
 					return false;
-				case XK_l:
+				case 'l':
 					/* Loud is terminal and means unmuted at full volume. */
 					app->volume_key_hold = (VolumeKeyHold){0};
 					app->muted = false;
@@ -734,11 +790,11 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 						MAX_VOLUME);
 					show_exit_feedback(app);
 					return false;
-				case XK_q:
-				case XK_Escape:
+				case 'q':
+				case KEYSYM_ESCAPE:
 					return false;
-				case XK_c:
-				case XK_d:
+				case 'c':
+				case 'd':
 					if (control_pressed) {
 						return false;
 					}
@@ -760,14 +816,13 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 			request_draw(app);
 			break;
 		case XCB_MAP_NOTIFY:
-			debugf("XCB_MAP_NOTIFY received\n");
+			debugf("Popup mapped and ready for input in %.3f ms\n",
+				elapsed_milliseconds(app->startup_started_at,
+					monotonic_now()));
 			break;
-		default: {
-			const char *label = xcb_event_get_label(response_type);
-			debugf("Unhandled X11 event %u (%s)\n", response_type,
-				label != NULL ? label : "unknown");
+		default:
+			debugf("Unhandled X11 event %u\n", response_type);
 			break;
-		}
 	}
 
 	return true;
@@ -827,6 +882,7 @@ static InitResult app_init(App *app)
 	InitResult popup_result;
 
 	memset(app, 0, sizeof(*app));
+	app->startup_started_at = monotonic_now();
 	app->window_width = POPUP_WIDTH;
 	app->window_height = POPUP_HEIGHT;
 	if (!connection_init(&app->connection)) {
@@ -867,13 +923,13 @@ static InitResult app_init(App *app)
 	focus_popup(&app->connection, app->window);
 
 	/* Grabs let one focused popup consume its complete command vocabulary. */
-	grab_key(&app->connection, XK_j);
-	grab_key(&app->connection, XK_k);
-	grab_key(&app->connection, XK_q);
-	grab_key(&app->connection, XK_m);
-	grab_key(&app->connection, XK_s);
-	grab_key(&app->connection, XK_l);
-	grab_key(&app->connection, XK_Escape);
+	grab_key(&app->connection, 'j');
+	grab_key(&app->connection, 'k');
+	grab_key(&app->connection, 'q');
+	grab_key(&app->connection, 'm');
+	grab_key(&app->connection, 's');
+	grab_key(&app->connection, 'l');
+	grab_key(&app->connection, KEYSYM_ESCAPE);
 	xcb_flush(app->connection.handle);
 	draw(app);
 	return INIT_READY;
