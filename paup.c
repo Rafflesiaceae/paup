@@ -40,6 +40,7 @@ typedef struct {
 
 typedef enum {
 	TERMINAL_ACTION_NONE,
+	TERMINAL_ACTION_TOGGLE_MUTE,
 	TERMINAL_ACTION_SILENCE,
 	TERMINAL_ACTION_LOUD,
 } TerminalAction;
@@ -428,6 +429,18 @@ static void request_draw(App *app)
 	app->redraw_pending = true;
 }
 
+static void toggle_mute(App *app)
+{
+	app->muted = !app->muted;
+	if (app->device_ready) {
+		pulse_client_set_mute(&app->pulse, &app->device, app->muted);
+	} else {
+		/* Replay the toggle after asynchronous sink discovery completes. */
+		app->startup_mute_toggle = !app->startup_mute_toggle;
+	}
+	request_draw(app);
+}
+
 static void show_exit_feedback(App *app)
 {
 	struct timespec remaining = {
@@ -628,6 +641,15 @@ static bool finish_pulse_startup(App *app)
 	app->device_ready = true;
 	app->volume = app->device.volume_percent;
 	app->muted = app->device.muted;
+	if (app->startup_terminal_action == TERMINAL_ACTION_TOGGLE_MUTE) {
+		/* Preserve the net mute state requested during sink discovery. */
+		if (app->startup_mute_toggle) {
+			app->muted = !app->muted;
+			pulse_client_set_mute(&app->pulse, &app->device, app->muted);
+		}
+		show_exit_feedback(app);
+		return false;
+	}
 	if (app->startup_terminal_action == TERMINAL_ACTION_SILENCE) {
 		app->muted = true;
 		pulse_client_set_mute(&app->pulse, &app->device, true);
@@ -737,6 +759,7 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 			xcb_key_press_event_t *press = (xcb_key_press_event_t *)event;
 			xcb_keysym_t keysym = lookup_keysym(&app->connection,
 				press->detail);
+			bool shift_pressed = (press->state & XCB_MOD_MASK_SHIFT) != 0;
 			bool control_pressed =
 				(press->state & XCB_MOD_MASK_CONTROL) != 0;
 
@@ -750,16 +773,19 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					start_volume_hold(app, 1, press->detail);
 					break;
 				case 'm':
-					app->muted = !app->muted;
-					if (app->device_ready) {
-						pulse_client_set_mute(&app->pulse, &app->device,
-							app->muted);
-					} else {
-						app->startup_mute_toggle =
-							!app->startup_mute_toggle;
+					toggle_mute(app);
+					if (shift_pressed) {
+						break;
 					}
-					request_draw(app);
-					break;
+					/* Lowercase mute is terminal, matching silence and loud. */
+					app->volume_key_hold = (VolumeKeyHold){0};
+					if (!app->device_ready) {
+						app->startup_terminal_action =
+							TERMINAL_ACTION_TOGGLE_MUTE;
+						break;
+					}
+					show_exit_feedback(app);
+					return false;
 				case 's':
 					/* Silence is terminal, so render its known final state. */
 					app->volume_key_hold = (VolumeKeyHold){0};
@@ -978,7 +1004,8 @@ static void print_help(const char *program_name)
 		"\n"
 		"Keys:\n"
 		"  j / k        Decrease / increase volume\n"
-		"  m            Toggle mute\n"
+		"  m            Toggle mute, then exit\n"
+		"  M            Toggle mute and remain open\n"
 		"  s / l        Silence / set full volume, then exit\n"
 		"  q / Escape   Exit\n",
 		program_name);
