@@ -1,0 +1,818 @@
+#define XK_LATIN1
+#define XK_MISCELLANY
+
+#include "pulse.h"
+
+#include <X11/keysymdef.h>
+#include <poll.h>
+#include <xcb/xcb.h>
+#include <xcb/xcb_keysyms.h>
+#include <xcb/xcb_util.h>
+
+#include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+enum {
+	MAX_VOLUME = 100,
+	POPUP_WIDTH = 40,
+	POPUP_HEIGHT = 130,
+	POPUP_MARGIN = 20,
+	EXIT_FEEDBACK_MILLISECONDS = 17,
+	VOLUME_REPEAT_DELAY_MILLISECONDS = 200,
+	VOLUME_REPEAT_INTERVAL_MILLISECONDS = 10,
+	BUFFER_SIZE = 1024,
+};
+
+typedef struct {
+	xcb_connection_t *handle;
+	xcb_key_symbols_t *symbols;
+	xcb_screen_t *screen;
+} Connection;
+
+typedef struct {
+	int direction;
+	xcb_keycode_t keycode;
+	struct timespec next_step;
+} VolumeKeyHold;
+
+typedef struct {
+	Connection connection;
+	PulseClient pulse;
+	PulseDevice device;
+	bool pulse_initialized;
+	xcb_atom_t active_window_atom;
+	xcb_atom_t instance_atom;
+	xcb_window_t window;
+	xcb_pixmap_t buffer;
+	xcb_gcontext_t background;
+	xcb_gcontext_t foreground;
+	xcb_gcontext_t foreground_muted;
+	uint16_t window_width;
+	uint16_t window_height;
+	int volume;
+	bool muted;
+	bool redraw_pending;
+	bool volume_sync_pending;
+	long pending_volume;
+	VolumeKeyHold volume_key_hold;
+} App;
+
+typedef enum {
+	INIT_ERROR = -1,
+	INIT_EXISTING = 0,
+	INIT_READY = 1,
+} InitResult;
+
+static bool debug_enabled;
+
+static void debugf(const char *format, ...)
+{
+	va_list arguments;
+
+	if (!debug_enabled) {
+		return;
+	}
+
+	va_start(arguments, format);
+	vfprintf(stderr, format, arguments);
+	va_end(arguments);
+	fflush(stderr);
+}
+
+static bool connection_init(Connection *connection)
+{
+	const xcb_setup_t *setup;
+	xcb_screen_iterator_t screens;
+	int screen_number = 0;
+
+	memset(connection, 0, sizeof(*connection));
+	connection->handle = xcb_connect(NULL, &screen_number);
+	if (connection->handle == NULL
+		|| xcb_connection_has_error(connection->handle)) {
+		debugf("Failed to connect to X11\n");
+		return false;
+	}
+
+	/* Select the screen returned by xcb_connect instead of assuming screen 0. */
+	setup = xcb_get_setup(connection->handle);
+	screens = xcb_setup_roots_iterator(setup);
+	while (screen_number-- > 0) {
+		xcb_screen_next(&screens);
+	}
+	connection->screen = screens.data;
+	connection->symbols = xcb_key_symbols_alloc(connection->handle);
+	if (connection->screen == NULL || connection->symbols == NULL) {
+		debugf("Failed to initialize X11 screen or keyboard symbols\n");
+		return false;
+	}
+
+	return true;
+}
+
+static void connection_cleanup(Connection *connection)
+{
+	if (connection->symbols != NULL) {
+		xcb_key_symbols_free(connection->symbols);
+		connection->symbols = NULL;
+	}
+	if (connection->handle != NULL) {
+		xcb_disconnect(connection->handle);
+		connection->handle = NULL;
+	}
+}
+
+static bool request_succeeded(Connection *connection, xcb_void_cookie_t cookie,
+	const char *description)
+{
+	xcb_generic_error_t *error = xcb_request_check(connection->handle, cookie);
+
+	if (error == NULL) {
+		return true;
+	}
+
+	debugf("%s failed with X11 error %u\n", description, error->error_code);
+	free(error);
+	return false;
+}
+
+static xcb_atom_t read_atom(Connection *connection, const char *name)
+{
+	xcb_intern_atom_cookie_t cookie;
+	xcb_intern_atom_reply_t *reply;
+	xcb_atom_t atom;
+
+	cookie = xcb_intern_atom(connection->handle, false, strlen(name), name);
+	reply = xcb_intern_atom_reply(connection->handle, cookie, NULL);
+	if (reply == NULL) {
+		debugf("Failed to read X11 atom '%s'\n", name);
+		return XCB_ATOM_NONE;
+	}
+
+	atom = reply->atom;
+	free(reply);
+	debugf("Read X11 atom '%s' -> %u\n", name, atom);
+	return atom;
+}
+
+static void grab_key(Connection *connection, xcb_keysym_t keysym)
+{
+	xcb_keycode_t *keycodes;
+	xcb_void_cookie_t cookie;
+
+	keycodes = xcb_key_symbols_get_keycode(connection->symbols, keysym);
+	if (keycodes == NULL || keycodes[0] == XCB_NO_SYMBOL) {
+		debugf("No X11 keycode for keysym 0x%x\n", keysym);
+		free(keycodes);
+		return;
+	}
+
+	cookie = xcb_grab_key_checked(connection->handle, true,
+		connection->screen->root, XCB_MOD_MASK_ANY, keycodes[0],
+		XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
+	if (request_succeeded(connection, cookie, "Key grab")) {
+		debugf("Grabbed keysym 0x%x as keycode %u\n", keysym, keycodes[0]);
+	}
+	free(keycodes);
+}
+
+static uint32_t get_color_pixel(Connection *connection, uint16_t red,
+	uint16_t green, uint16_t blue)
+{
+	xcb_alloc_color_cookie_t cookie;
+	xcb_alloc_color_reply_t *reply;
+	uint32_t pixel;
+
+	/* X11 accepts 16-bit components, while PAUP's palette uses 8-bit RGB. */
+	red = (uint16_t)(65535U * (red & 0xffU) / 255U);
+	green = (uint16_t)(65535U * (green & 0xffU) / 255U);
+	blue = (uint16_t)(65535U * (blue & 0xffU) / 255U);
+	cookie = xcb_alloc_color(connection->handle,
+		connection->screen->default_colormap, red, green, blue);
+	reply = xcb_alloc_color_reply(connection->handle, cookie, NULL);
+	if (reply == NULL) {
+		debugf("Failed to allocate X11 color\n");
+		return UINT32_MAX;
+	}
+
+	pixel = reply->pixel;
+	free(reply);
+	return pixel;
+}
+
+static bool create_graphics_context(App *app, xcb_gcontext_t *context,
+	uint32_t pixel)
+{
+	uint32_t values[] = {pixel, false};
+	uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_GRAPHICS_EXPOSURES;
+
+	*context = xcb_generate_id(app->connection.handle);
+	return request_succeeded(&app->connection,
+		xcb_create_gc_checked(app->connection.handle, *context,
+			app->connection.screen->root, mask, values),
+		"Graphics context creation");
+}
+
+static void focus_popup(Connection *connection, xcb_window_t window)
+{
+	/* Override-redirect windows must be raised and focused without a WM. */
+	uint32_t stack_mode = XCB_STACK_MODE_ABOVE;
+	xcb_configure_window(connection->handle, window,
+		XCB_CONFIG_WINDOW_STACK_MODE, &stack_mode);
+	xcb_set_input_focus(connection->handle, XCB_INPUT_FOCUS_POINTER_ROOT,
+		window, XCB_CURRENT_TIME);
+}
+
+static InitResult create_popup_or_focus_existing(App *app, uint32_t event_mask)
+{
+	Connection *connection = &app->connection;
+	xcb_get_selection_owner_cookie_t owner_cookie;
+	xcb_get_selection_owner_reply_t *owner_reply;
+	xcb_window_t existing_window;
+	uint32_t create_mask;
+	uint32_t create_values[2];
+	xcb_void_cookie_t create_cookie;
+
+	/* The server grab makes selection ownership atomic across launches. */
+	xcb_grab_server(connection->handle);
+	owner_cookie = xcb_get_selection_owner(connection->handle,
+		app->instance_atom);
+	owner_reply = xcb_get_selection_owner_reply(connection->handle,
+		owner_cookie, NULL);
+	if (owner_reply == NULL) {
+		xcb_ungrab_server(connection->handle);
+		xcb_flush(connection->handle);
+		debugf("Failed to query the existing PAUP instance\n");
+		return INIT_ERROR;
+	}
+
+	existing_window = owner_reply->owner;
+	free(owner_reply);
+	if (existing_window != XCB_NONE) {
+		xcb_ungrab_server(connection->handle);
+		focus_popup(connection, existing_window);
+		xcb_flush(connection->handle);
+		debugf("Focused existing popup window %u\n", existing_window);
+		return INIT_EXISTING;
+	}
+
+	create_mask = XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+	create_values[0] = true;
+	create_values[1] = event_mask;
+	app->window = xcb_generate_id(connection->handle);
+	create_cookie = xcb_create_window_checked(connection->handle,
+		XCB_COPY_FROM_PARENT, app->window, connection->screen->root,
+		POPUP_MARGIN, POPUP_MARGIN, POPUP_WIDTH, POPUP_HEIGHT, 0,
+		XCB_WINDOW_CLASS_INPUT_OUTPUT, connection->screen->root_visual,
+		create_mask, create_values);
+	if (!request_succeeded(connection, create_cookie, "Popup creation")) {
+		xcb_ungrab_server(connection->handle);
+		xcb_flush(connection->handle);
+		return INIT_ERROR;
+	}
+
+	/* X11 drops this single-instance claim when the popup is destroyed. */
+	xcb_set_selection_owner(connection->handle, app->window,
+		app->instance_atom, XCB_CURRENT_TIME);
+	xcb_ungrab_server(connection->handle);
+	return INIT_READY;
+}
+
+static void draw(App *app)
+{
+	xcb_connection_t *connection = app->connection.handle;
+	xcb_rectangle_t foreground_rectangle;
+	xcb_rectangle_t background_rectangle;
+	int displayed_volume = app->volume;
+	uint16_t filled_height;
+
+	/* Protect X11 rectangle arithmetic if PulseAudio reports amplification. */
+	if (displayed_volume < 0) {
+		displayed_volume = 0;
+	} else if (displayed_volume > MAX_VOLUME) {
+		displayed_volume = MAX_VOLUME;
+	}
+	filled_height = (uint16_t)((app->window_height * displayed_volume)
+		/ MAX_VOLUME);
+	foreground_rectangle = (xcb_rectangle_t){
+		.x = 0,
+		.y = (int16_t)(app->window_height - filled_height),
+		.width = app->window_width,
+		.height = filled_height,
+	};
+	background_rectangle = (xcb_rectangle_t){
+		.x = 0,
+		.y = 0,
+		.width = app->window_width,
+		.height = app->window_height,
+	};
+
+	xcb_poly_fill_rectangle(connection, app->buffer, app->background,
+		1, &background_rectangle);
+	xcb_poly_fill_rectangle(connection, app->buffer,
+		app->muted ? app->foreground_muted : app->foreground,
+		1, &foreground_rectangle);
+	xcb_copy_area(connection, app->buffer, app->window, app->foreground,
+		0, 0, 0, 0, app->window_width, app->window_height);
+	xcb_flush(connection);
+	app->redraw_pending = false;
+	debugf("Redrew, volume=%d muted=%d size=%ux%u\n", app->volume,
+		app->muted, app->window_width, app->window_height);
+}
+
+static void request_draw(App *app)
+{
+	app->redraw_pending = true;
+}
+
+static void show_exit_feedback(App *app)
+{
+	struct timespec remaining = {
+		.tv_sec = 0,
+		.tv_nsec = EXIT_FEEDBACK_MILLISECONDS * 1000000L,
+	};
+
+	/* Leave the final state mapped for one nominal 60 Hz display frame. */
+	draw(app);
+	while (nanosleep(&remaining, &remaining) < 0 && errno == EINTR) {
+		/* Resume the unslept portion when a signal interrupts feedback. */
+	}
+}
+
+static struct timespec monotonic_now(void)
+{
+	struct timespec now = {0};
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now;
+}
+
+static struct timespec add_milliseconds(struct timespec time, long milliseconds)
+{
+	time.tv_sec += milliseconds / 1000;
+	time.tv_nsec += (milliseconds % 1000) * 1000000L;
+	if (time.tv_nsec >= 1000000000L) {
+		time.tv_sec++;
+		time.tv_nsec -= 1000000000L;
+	}
+	return time;
+}
+
+static int compare_times(struct timespec left, struct timespec right)
+{
+	if (left.tv_sec != right.tv_sec) {
+		return left.tv_sec < right.tv_sec ? -1 : 1;
+	}
+	if (left.tv_nsec != right.tv_nsec) {
+		return left.tv_nsec < right.tv_nsec ? -1 : 1;
+	}
+	return 0;
+}
+
+static void request_volume_sync(App *app)
+{
+	app->pending_volume = app->volume;
+	app->volume_sync_pending = true;
+}
+
+static bool adjust_volume(App *app, int delta)
+{
+	int requested_volume = app->volume + delta;
+	int new_volume = requested_volume;
+
+	if (new_volume < 0) {
+		new_volume = 0;
+	} else if (new_volume > MAX_VOLUME) {
+		new_volume = MAX_VOLUME;
+	}
+	if (new_volume == app->volume) {
+		return false;
+	}
+
+	app->volume = new_volume;
+	request_volume_sync(app);
+	request_draw(app);
+	return true;
+}
+
+static void start_volume_hold(App *app, int direction, xcb_keycode_t keycode)
+{
+	struct timespec now;
+
+	/* Ignore X11 auto-repeat presses; the monotonic timer owns repetition. */
+	if (app->volume_key_hold.direction != 0
+		&& app->volume_key_hold.keycode == keycode) {
+		return;
+	}
+
+	now = monotonic_now();
+	app->volume_key_hold.direction = direction;
+	app->volume_key_hold.keycode = keycode;
+	app->volume_key_hold.next_step = add_milliseconds(now,
+		VOLUME_REPEAT_DELAY_MILLISECONDS);
+	adjust_volume(app, direction);
+}
+
+static bool key_is_down(Connection *connection, xcb_keycode_t keycode)
+{
+	xcb_query_keymap_cookie_t cookie;
+	xcb_query_keymap_reply_t *reply;
+	bool is_down;
+
+	/* The server keymap distinguishes releases from legacy auto-repeat. */
+	cookie = xcb_query_keymap(connection->handle);
+	reply = xcb_query_keymap_reply(connection->handle, cookie, NULL);
+	if (reply == NULL) {
+		return false;
+	}
+
+	is_down = (reply->keys[keycode / 8U]
+		& (uint8_t)(1U << (keycode % 8U))) != 0;
+	free(reply);
+	return is_down;
+}
+
+static void stop_volume_hold_if_released(App *app, xcb_keycode_t keycode)
+{
+	if (app->volume_key_hold.direction == 0
+		|| app->volume_key_hold.keycode != keycode) {
+		return;
+	}
+	if (!key_is_down(&app->connection, keycode)) {
+		app->volume_key_hold = (VolumeKeyHold){0};
+	}
+}
+
+static void advance_volume_hold(App *app)
+{
+	struct timespec now = monotonic_now();
+
+	while (app->volume_key_hold.direction != 0
+		&& compare_times(now, app->volume_key_hold.next_step) >= 0) {
+		if (!adjust_volume(app, app->volume_key_hold.direction)) {
+			app->volume_key_hold = (VolumeKeyHold){0};
+			return;
+		}
+		app->volume_key_hold.next_step = add_milliseconds(
+			app->volume_key_hold.next_step,
+			VOLUME_REPEAT_INTERVAL_MILLISECONDS);
+	}
+}
+
+static int volume_hold_timeout_milliseconds(const App *app)
+{
+	struct timespec now;
+	int64_t nanoseconds;
+	int64_t milliseconds;
+
+	if (app->volume_key_hold.direction == 0) {
+		return -1;
+	}
+
+	now = monotonic_now();
+	nanoseconds = (int64_t)(app->volume_key_hold.next_step.tv_sec
+		- now.tv_sec) * 1000000000LL;
+	nanoseconds += app->volume_key_hold.next_step.tv_nsec - now.tv_nsec;
+	if (nanoseconds <= 0) {
+		return 0;
+	}
+
+	/* poll() takes whole milliseconds, so round up to avoid early wakeups. */
+	milliseconds = (nanoseconds + 999999LL) / 1000000LL;
+	return milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
+}
+
+static void do_best_effort_work(App *app)
+{
+	if (app->volume_sync_pending) {
+		app->volume_sync_pending = false;
+		pulse_client_set_volume_async(&app->pulse, &app->device,
+			app->pending_volume);
+	}
+
+	pulse_client_iterate(&app->pulse, false);
+	if (app->redraw_pending) {
+		draw(app);
+	}
+}
+
+static bool handle_event(App *app, xcb_generic_event_t *event)
+{
+	uint8_t response_type = event->response_type & (uint8_t)~0x80U;
+
+	switch (response_type) {
+		case 0: {
+			xcb_generic_error_t *error = (xcb_generic_error_t *)event;
+			debugf("X11 error: code=%u sequence=%u resource=%u minor=%u major=%u\n",
+				error->error_code, error->sequence, error->resource_id,
+				error->minor_code, error->major_code);
+			break;
+		}
+		case XCB_EXPOSE: {
+			xcb_expose_event_t *expose = (xcb_expose_event_t *)event;
+			xcb_copy_area(app->connection.handle, app->buffer, app->window,
+				app->foreground, expose->x, expose->y, expose->x, expose->y,
+				expose->width, expose->height);
+			xcb_flush(app->connection.handle);
+			debugf("XCB_EXPOSE\n");
+			break;
+		}
+		case XCB_CONFIGURE_NOTIFY: {
+			xcb_configure_notify_event_t *configure =
+				(xcb_configure_notify_event_t *)event;
+			app->window_width = configure->width;
+			app->window_height = configure->height;
+			request_draw(app);
+			debugf("XCB_CONFIGURE_NOTIFY size=%ux%u\n",
+				app->window_width, app->window_height);
+			break;
+		}
+		case XCB_FOCUS_IN:
+		case XCB_FOCUS_OUT:
+			break;
+		case XCB_PROPERTY_NOTIFY: {
+			xcb_property_notify_event_t *property =
+				(xcb_property_notify_event_t *)event;
+			if (property->atom == app->active_window_atom) {
+				xcb_get_input_focus_cookie_t cookie =
+					xcb_get_input_focus(app->connection.handle);
+				xcb_get_input_focus_reply_t *reply =
+					xcb_get_input_focus_reply(app->connection.handle,
+						cookie, NULL);
+				if (reply != NULL && reply->focus != app->window) {
+					debugf("Focus moved away from the popup; exiting\n");
+					free(reply);
+					return false;
+				}
+				free(reply);
+			}
+			break;
+		}
+		case XCB_KEY_PRESS: {
+			xcb_key_press_event_t *press = (xcb_key_press_event_t *)event;
+			xcb_keysym_t keysym = xcb_key_press_lookup_keysym(
+				app->connection.symbols, press, 0);
+			bool control_pressed =
+				(press->state & XCB_MOD_MASK_CONTROL) != 0;
+
+			debugf("KEY_PRESS: keysym=%u state=0x%x\n", keysym,
+				press->state);
+			switch (keysym) {
+				case XK_j:
+					start_volume_hold(app, -1, press->detail);
+					break;
+				case XK_k:
+					start_volume_hold(app, 1, press->detail);
+					break;
+				case XK_m:
+					app->muted = !app->muted;
+					pulse_client_set_mute(&app->pulse, &app->device,
+						app->muted);
+					request_draw(app);
+					break;
+				case XK_s:
+					/* Silence is terminal, so render its known final state. */
+					app->volume_key_hold = (VolumeKeyHold){0};
+					app->muted = true;
+					pulse_client_set_mute(&app->pulse, &app->device, true);
+					show_exit_feedback(app);
+					return false;
+				case XK_l:
+					/* Loud is terminal and means unmuted at full volume. */
+					app->volume_key_hold = (VolumeKeyHold){0};
+					app->muted = false;
+					app->volume = MAX_VOLUME;
+					pulse_client_set_mute(&app->pulse, &app->device, false);
+					pulse_client_set_volume(&app->pulse, &app->device,
+						MAX_VOLUME);
+					show_exit_feedback(app);
+					return false;
+				case XK_q:
+				case XK_Escape:
+					return false;
+				case XK_c:
+				case XK_d:
+					if (control_pressed) {
+						return false;
+					}
+					break;
+				default:
+					break;
+			}
+			break;
+		}
+		case XCB_KEY_RELEASE: {
+			xcb_key_release_event_t *release =
+				(xcb_key_release_event_t *)event;
+			stop_volume_hold_if_released(app, release->detail);
+			break;
+		}
+		case XCB_BUTTON_PRESS:
+			/* Preserve the popup's existing click-to-preview behavior. */
+			app->volume++;
+			request_draw(app);
+			break;
+		case XCB_MAP_NOTIFY:
+			debugf("XCB_MAP_NOTIFY received\n");
+			break;
+		default: {
+			const char *label = xcb_event_get_label(response_type);
+			debugf("Unhandled X11 event %u (%s)\n", response_type,
+				label != NULL ? label : "unknown");
+			break;
+		}
+	}
+
+	return true;
+}
+
+static bool run_event_loop(App *app)
+{
+	bool running = true;
+
+	while (running && !xcb_connection_has_error(app->connection.handle)) {
+		xcb_generic_event_t *event =
+			xcb_poll_for_event(app->connection.handle);
+		if (event == NULL) {
+			struct pollfd x11_poll = {
+				.fd = xcb_get_file_descriptor(app->connection.handle),
+				.events = POLLIN,
+			};
+
+			advance_volume_hold(app);
+			do_best_effort_work(app);
+			if (poll(&x11_poll, 1,
+				volume_hold_timeout_milliseconds(app)) < 0
+				&& errno != EINTR) {
+				debugf("Failed while polling X11: %s\n", strerror(errno));
+				return false;
+			}
+			continue;
+		}
+
+		running = handle_event(app, event);
+		free(event);
+		if (running) {
+			advance_volume_hold(app);
+			do_best_effort_work(app);
+		}
+	}
+
+	debugf("Exiting main loop\n");
+	return xcb_connection_has_error(app->connection.handle) == 0;
+}
+
+static InitResult app_init(App *app)
+{
+	uint32_t event_mask;
+	uint32_t root_event_mask = XCB_EVENT_MASK_PROPERTY_CHANGE;
+	uint32_t foreground_pixel;
+	uint32_t muted_pixel;
+	uint32_t background_pixel;
+	InitResult popup_result;
+
+	memset(app, 0, sizeof(*app));
+	app->window_width = POPUP_WIDTH;
+	app->window_height = POPUP_HEIGHT;
+	if (!connection_init(&app->connection)) {
+		return INIT_ERROR;
+	}
+
+	app->active_window_atom = read_atom(&app->connection,
+		"_NET_ACTIVE_WINDOW");
+	app->instance_atom = read_atom(&app->connection, "_PAUP_INSTANCE");
+	if (app->active_window_atom == XCB_ATOM_NONE
+		|| app->instance_atom == XCB_ATOM_NONE) {
+		return INIT_ERROR;
+	}
+
+	event_mask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS
+		| XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS
+		| XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE
+		| XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_LEAVE_WINDOW
+		| XCB_EVENT_MASK_ENTER_WINDOW;
+	popup_result = create_popup_or_focus_existing(app, event_mask);
+	if (popup_result != INIT_READY) {
+		return popup_result;
+	}
+
+	if (!pulse_client_init(&app->pulse, "paup")) {
+		return INIT_ERROR;
+	}
+	app->pulse_initialized = true;
+	if (!pulse_client_get_default_sink(&app->pulse, &app->device)) {
+		debugf("Failed to get the default PulseAudio sink\n");
+		return INIT_ERROR;
+	}
+	app->volume = app->device.volume_percent;
+	app->muted = app->device.muted;
+
+	foreground_pixel = get_color_pixel(&app->connection, 0xa6, 0xe2, 0x2e);
+	muted_pixel = get_color_pixel(&app->connection, 0xff, 0x45, 0x35);
+	background_pixel = get_color_pixel(&app->connection, 0x38, 0x38, 0x30);
+	if (foreground_pixel == UINT32_MAX || muted_pixel == UINT32_MAX
+		|| background_pixel == UINT32_MAX) {
+		return INIT_ERROR;
+	}
+	if (!create_graphics_context(app, &app->foreground, foreground_pixel)
+		|| !create_graphics_context(app, &app->foreground_muted, muted_pixel)
+		|| !create_graphics_context(app, &app->background, background_pixel)) {
+		return INIT_ERROR;
+	}
+
+	app->buffer = xcb_generate_id(app->connection.handle);
+	if (!request_succeeded(&app->connection,
+		xcb_create_pixmap_checked(app->connection.handle,
+			app->connection.screen->root_depth, app->buffer, app->window,
+			BUFFER_SIZE, BUFFER_SIZE), "Pixmap creation")) {
+		return INIT_ERROR;
+	}
+	if (!request_succeeded(&app->connection,
+		xcb_change_window_attributes_checked(app->connection.handle,
+			app->connection.screen->root, XCB_CW_EVENT_MASK,
+			&root_event_mask), "Root event selection")) {
+		return INIT_ERROR;
+	}
+	if (!request_succeeded(&app->connection,
+		xcb_map_window_checked(app->connection.handle, app->window),
+		"Popup mapping")) {
+		return INIT_ERROR;
+	}
+	focus_popup(&app->connection, app->window);
+
+	/* Grabs let one focused popup consume its complete command vocabulary. */
+	grab_key(&app->connection, XK_j);
+	grab_key(&app->connection, XK_k);
+	grab_key(&app->connection, XK_q);
+	grab_key(&app->connection, XK_m);
+	grab_key(&app->connection, XK_s);
+	grab_key(&app->connection, XK_l);
+	grab_key(&app->connection, XK_Escape);
+	xcb_flush(app->connection.handle);
+	draw(app);
+	return INIT_READY;
+}
+
+static void app_cleanup(App *app)
+{
+	if (app->pulse_initialized) {
+		pulse_client_cleanup(&app->pulse);
+		app->pulse_initialized = false;
+	}
+
+	/* Disconnecting would release these resources too, but explicit cleanup
+	 * keeps repeated initialization safe and documents their ownership. */
+	if (app->connection.handle != NULL) {
+		if (app->buffer != XCB_NONE) {
+			xcb_free_pixmap(app->connection.handle, app->buffer);
+		}
+		if (app->background != XCB_NONE) {
+			xcb_free_gc(app->connection.handle, app->background);
+		}
+		if (app->foreground_muted != XCB_NONE) {
+			xcb_free_gc(app->connection.handle, app->foreground_muted);
+		}
+		if (app->foreground != XCB_NONE) {
+			xcb_free_gc(app->connection.handle, app->foreground);
+		}
+		if (app->window != XCB_NONE) {
+			xcb_destroy_window(app->connection.handle, app->window);
+		}
+		xcb_flush(app->connection.handle);
+	}
+	connection_cleanup(&app->connection);
+}
+
+int main(int argc, char **argv)
+{
+	App app;
+	InitResult result;
+	bool loop_succeeded;
+	int argument;
+
+	for (argument = 1; argument < argc; argument++) {
+		if (strcmp(argv[argument], "-d") == 0
+			|| strcmp(argv[argument], "--debug") == 0) {
+			debug_enabled = true;
+		}
+	}
+
+	result = app_init(&app);
+	if (result == INIT_EXISTING) {
+		app_cleanup(&app);
+		return EXIT_SUCCESS;
+	}
+	if (result == INIT_ERROR) {
+		app_cleanup(&app);
+		return EXIT_FAILURE;
+	}
+
+	loop_succeeded = run_event_loop(&app);
+	app_cleanup(&app);
+	return loop_succeeded ? EXIT_SUCCESS : EXIT_FAILURE;
+}
