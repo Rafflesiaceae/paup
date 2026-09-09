@@ -909,6 +909,25 @@ static void app_cleanup(App *app)
 	connection_cleanup(&app->connection);
 }
 
+static void print_help(const char *program_name)
+{
+	printf(
+		"Usage: %s [OPTIONS]\n"
+		"\n"
+		"Show an interactive popup for the default audio sink.\n"
+		"\n"
+		"Options:\n"
+		"  -d, --debug  Print diagnostic messages\n"
+		"  -h, --help   Show this help and exit\n"
+		"\n"
+		"Keys:\n"
+		"  j / k        Decrease / increase volume\n"
+		"  m            Toggle mute\n"
+		"  s / l        Silence / set full volume, then exit\n"
+		"  q / Escape   Exit\n",
+		program_name);
+}
+
 int main(int argc, char **argv)
 {
 	App app;
@@ -917,6 +936,12 @@ int main(int argc, char **argv)
 	int argument;
 
 	for (argument = 1; argument < argc; argument++) {
+		if (strcmp(argv[argument], "-h") == 0
+			|| strcmp(argv[argument], "--help") == 0) {
+			/* Help must work without an X11 or PulseAudio connection. */
+			print_help(argv[0]);
+			return EXIT_SUCCESS;
+		}
 		if (strcmp(argv[argument], "-d") == 0
 			|| strcmp(argv[argument], "--debug") == 0) {
 			debug_enabled = true;
