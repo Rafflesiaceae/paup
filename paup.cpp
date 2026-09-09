@@ -294,9 +294,7 @@ bool create_popup_or_focus_existing(xcb_connection_t *conhandle, xcb_screen_t *s
 		return false;
 	}
 
-	const int16_t popup_x = screen->width_in_pixels > POPUP_WIDTH + POPUP_MARGIN
-		? static_cast<int16_t>(screen->width_in_pixels - POPUP_WIDTH - POPUP_MARGIN)
-		: 0;
+	const int16_t popup_x = POPUP_MARGIN;
 	const int16_t popup_y = POPUP_MARGIN;
 	const uint32_t create_mask = XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
 	const uint32_t create_values[] = {1, windowmask};
