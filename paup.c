@@ -174,7 +174,7 @@ static void grab_key(Connection *connection, xcb_keysym_t keysym)
 	}
 
 	cookie = xcb_grab_key_checked(connection->handle, true,
-		connection->screen->root, XCB_MOD_MASK_ANY, keycodes[0],
+		connection->screen->root, 0, keycodes[0],
 		XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
 	if (request_succeeded(connection, cookie, "Key grab")) {
 		debugf("Grabbed keysym 0x%x as keycode %u\n", keysym, keycodes[0]);

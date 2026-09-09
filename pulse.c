@@ -192,6 +192,8 @@ bool pulse_client_init(PulseClient *client, const char *client_name)
 		return false;
 	}
 
+	/* The connection state outlives this function, but its stack variable does not. */
+	pa_context_set_state_callback(client->context, NULL, NULL);
 	return true;
 }
 
