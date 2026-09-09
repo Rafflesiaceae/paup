@@ -17,6 +17,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <map>
+#include <thread>
 #include <typeinfo>
 #include <vector>
 #include <cassert>
@@ -183,6 +184,7 @@ const int MAX_VOL = 100;
 constexpr uint16_t POPUP_WIDTH = 40;
 constexpr uint16_t POPUP_HEIGHT = 130;
 constexpr uint16_t POPUP_MARGIN = 20;
+constexpr auto EXIT_FEEDBACK_DURATION = std::chrono::milliseconds(10);
 constexpr auto VOLUME_REPEAT_DELAY = std::chrono::milliseconds(200);
 Device *device;
 ServerInfo defaults;
@@ -230,6 +232,14 @@ void draw()
 void request_draw()
 {
 	redraw_pending = true;
+}
+
+void show_exit_feedback()
+{
+	// Keep the window alive for a nominal 60 Hz frame after submitting the
+	// final state, otherwise disconnecting from X11 can hide it immediately.
+	draw();
+	std::this_thread::sleep_for(EXIT_FEEDBACK_DURATION);
 }
 
 void request_volume_sync()
@@ -580,14 +590,19 @@ void init(int argc, char **argv)
 						case XK_s:
 							// Silence is an explicit terminal action, unlike the toggle.
 							volume_key_hold = {};
+							muted = true;
 							pulsecl.SetMute(*device, true);
+							show_exit_feedback();
 							goto exit;
 							break;
 						case XK_l:
 							// Loud always establishes a known unmuted, full-volume state.
 							volume_key_hold = {};
+							muted = false;
+							vol = MAX_VOL;
 							pulsecl.SetMute(*device, false);
 							pulsecl.SetVolume(*device, MAX_VOL);
+							show_exit_feedback();
 							goto exit;
 							break;
 						case XK_q:
