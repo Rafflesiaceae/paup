@@ -11,6 +11,9 @@
 #include <xcb/xcb_util.h>
 #include <X11/keysymdef.h>
 
+#include <poll.h>
+
+#include <chrono>
 #include <initializer_list>
 #include <iostream>
 #include <map>
@@ -180,6 +183,7 @@ const int MAX_VOL = 100;
 constexpr uint16_t POPUP_WIDTH = 40;
 constexpr uint16_t POPUP_HEIGHT = 130;
 constexpr uint16_t POPUP_MARGIN = 20;
+constexpr auto VOLUME_REPEAT_DELAY = std::chrono::milliseconds(250);
 Device *device;
 ServerInfo defaults;
 const char *opt_device;
@@ -189,6 +193,16 @@ uint16_t win_height = POPUP_HEIGHT;
 bool redraw_pending = false;
 bool volume_sync_pending = false;
 long pending_volume = 0;
+
+struct VolumeKeyHold
+{
+	int direction = 0;
+	xcb_keycode_t keycode = 0;
+	std::chrono::steady_clock::time_point started_at;
+	std::chrono::steady_clock::time_point next_step;
+};
+
+VolumeKeyHold volume_key_hold;
 
 PulseClient pulsecl("paup");
 
@@ -222,6 +236,84 @@ void request_volume_sync()
 {
 	pending_volume = vol;
 	volume_sync_pending = true;
+}
+
+bool adjust_volume(int delta)
+{
+	const int requested_volume = vol + delta;
+	const int new_volume = requested_volume < 0 ? 0 : (requested_volume > MAX_VOL ? MAX_VOL : requested_volume);
+	if (new_volume == vol) return false;
+
+	vol = new_volume;
+	request_volume_sync();
+	request_draw();
+	return true;
+}
+
+void start_volume_hold(int direction, xcb_keycode_t keycode)
+{
+	// Repeated KeyPress events from X11 must not affect the rate; only the
+	// first physical press changes the volume and starts the monotonic timer.
+	if (volume_key_hold.direction != 0 && volume_key_hold.keycode == keycode) return;
+
+	const auto now = std::chrono::steady_clock::now();
+	volume_key_hold = {direction, keycode, now, now + VOLUME_REPEAT_DELAY};
+	adjust_volume(direction);
+}
+
+bool key_is_down(xcb_connection_t *conhandle, xcb_keycode_t keycode)
+{
+	// Querying the server distinguishes a physical release from the synthetic
+	// release/press pairs produced by legacy X11 keyboard auto-repeat.
+	const auto cookie = xcb_query_keymap(conhandle);
+	auto *reply = xcb_query_keymap_reply(conhandle, cookie, NULL);
+	if (!reply) return false;
+
+	const bool is_down = reply->keys[keycode / 8] & (1U << (keycode % 8));
+	free(reply);
+	return is_down;
+}
+
+void stop_volume_hold_if_released(xcb_connection_t *conhandle, xcb_keycode_t keycode)
+{
+	if (volume_key_hold.direction == 0 || volume_key_hold.keycode != keycode) return;
+	if (!key_is_down(conhandle, keycode)) volume_key_hold = {};
+}
+
+void advance_volume_hold()
+{
+	const auto now = std::chrono::steady_clock::now();
+	while (volume_key_hold.direction != 0 && now >= volume_key_hold.next_step) {
+		const auto held_for = volume_key_hold.next_step - volume_key_hold.started_at;
+		int step = 1;
+		auto interval = std::chrono::milliseconds(100);
+
+		// Increase both the step and cadence in stages. Short taps remain precise,
+		// while a sustained hold reaches either end of the range very quickly.
+		if (held_for >= std::chrono::milliseconds(1500)) {
+			step = 5;
+			interval = std::chrono::milliseconds(20);
+		} else if (held_for >= std::chrono::milliseconds(800)) {
+			step = 2;
+			interval = std::chrono::milliseconds(50);
+		}
+
+		if (!adjust_volume(volume_key_hold.direction * step)) {
+			volume_key_hold = {};
+			return;
+		}
+		volume_key_hold.next_step += interval;
+	}
+}
+
+int volume_hold_timeout_ms()
+{
+	if (volume_key_hold.direction == 0) return -1;
+
+	const auto remaining = volume_key_hold.next_step - std::chrono::steady_clock::now();
+	const auto remaining_us = std::chrono::duration_cast<std::chrono::microseconds>(remaining).count();
+	if (remaining_us <= 0) return 0;
+	return static_cast<int>((remaining_us + 999) / 1000);
 }
 
 void do_best_effort_work()
@@ -360,6 +452,8 @@ void init(int argc, char **argv)
 	con.grabKey(0, XK_k);
 	con.grabKey(0, XK_q);
 	con.grabKey(0, XK_m);
+	con.grabKey(0, XK_s);
+	con.grabKey(0, XK_l);
 	con.grabKey(0, XK_Escape);
 
 	xcb_flush(conhandle);
@@ -379,10 +473,19 @@ void init(int argc, char **argv)
 	draw();
 
 	xcb_generic_event_t *ev;
-	xcb_generic_event_t *queued_ev = nullptr;
 	std::string logEvent = "";
-	while ((ev = queued_ev ? queued_ev : xcb_wait_for_event(conhandle))) {
-		queued_ev = nullptr;
+	while (!xcb_connection_has_error(conhandle)) {
+		ev = xcb_poll_for_event(conhandle);
+		if (!ev) {
+			advance_volume_hold();
+			do_best_effort_work();
+
+			// Wake for either an X11 event or the next independently timed
+			// volume step, rather than blocking on the keyboard repeat rate.
+			pollfd x11_poll = {xcb_get_file_descriptor(conhandle), POLLIN, 0};
+			poll(&x11_poll, 1, volume_hold_timeout_ms());
+			continue;
+		}
 
 		{  // log event
 			logEvent = "[";
@@ -463,31 +566,36 @@ void init(int argc, char **argv)
 					debugf("KEY_PRESS: keysym=%d [%d:%d:%d:%d]\n", keysym, shift_pressed, ctrl_pressed, alt_pressed, super_pressed);
 
 					switch (keysym) {
-						case 106:  // j or J
-							if (vol > 0) {
-								vol -= 1;
-								request_volume_sync();
-								request_draw();
-							}
+						case XK_j:
+							start_volume_hold(-1, e->detail);
 							break;
-						case 107:  // k or K
-							if (vol < MAX_VOL) {
-								vol += 1;
-								request_volume_sync();
-								request_draw();
-							}
+						case XK_k:
+							start_volume_hold(1, e->detail);
 							break;
-						case 109:  // m or M
+						case XK_m:
 							muted = !muted;
 							pulsecl.SetMute(*device, muted);
 							request_draw();
 							break;
-						case 113:        // q
+						case XK_s:
+							// Silence is an explicit terminal action, unlike the toggle.
+							volume_key_hold = {};
+							pulsecl.SetMute(*device, true);
+							goto exit;
+							break;
+						case XK_l:
+							// Loud always establishes a known unmuted, full-volume state.
+							volume_key_hold = {};
+							pulsecl.SetMute(*device, false);
+							pulsecl.SetVolume(*device, MAX_VOL);
+							goto exit;
+							break;
+						case XK_q:
 						case XK_Escape:  // Escape
 							goto exit;
 							break;
-						case 99:   // c or C
-						case 100:  // d or D
+						case XK_c:
+						case XK_d:
 							if (ctrl_pressed) {
 								goto exit;
 							}
@@ -497,6 +605,7 @@ void init(int argc, char **argv)
 				}
 			case XCB_KEY_RELEASE:
 				logEvent = "";
+				stop_volume_hold_if_released(conhandle, ((xcb_key_release_event_t *)ev)->detail);
 				break;
 			case XCB_BUTTON_PRESS:
 				vol += 1;
@@ -526,10 +635,8 @@ void init(int argc, char **argv)
 		if (ev != NULL) {
 			free(ev);
 		}
-		queued_ev = xcb_poll_for_queued_event(conhandle);
-		if (queued_ev == nullptr) {
-			do_best_effort_work();
-		}
+		advance_volume_hold();
+		do_best_effort_work();
 	}
 
 exit:
