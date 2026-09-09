@@ -286,17 +286,17 @@ void advance_volume_hold()
 	while (volume_key_hold.direction != 0 && now >= volume_key_hold.next_step) {
 		const auto held_for = volume_key_hold.next_step - volume_key_hold.started_at;
 		int step = 1;
-		auto interval = std::chrono::milliseconds(100);
+		auto interval = std::chrono::milliseconds(10);
 
-		// Increase both the step and cadence in stages. Short taps remain precise,
-		// while a sustained hold reaches either end of the range very quickly.
-		if (held_for >= std::chrono::milliseconds(1500)) {
-			step = 5;
-			interval = std::chrono::milliseconds(20);
-		} else if (held_for >= std::chrono::milliseconds(800)) {
-			step = 2;
-			interval = std::chrono::milliseconds(50);
-		}
+		// // Increase both the step and cadence in stages. Short taps remain precise,
+		// // while a sustained hold reaches either end of the range very quickly.
+		// if (held_for >= std::chrono::milliseconds(9000)) {
+		// 	step = 5;
+		// 	interval = std::chrono::milliseconds(1);
+		// } else if (held_for >= std::chrono::milliseconds(500)) {
+		// 	step = 2;
+		// 	interval = std::chrono::milliseconds(5);
+		// }
 
 		if (!adjust_volume(volume_key_hold.direction * step)) {
 			volume_key_hold = {};
