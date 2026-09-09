@@ -2,6 +2,8 @@
 
 #include "config.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,22 +12,6 @@ enum {
 	MIN_VOLUME = 0,
 	MAX_PULSE_VOLUME = 150,
 };
-
-typedef struct {
-	char *name;
-	bool received;
-} ServerQuery;
-
-typedef struct {
-	PulseDevice *device;
-	bool found;
-} SinkQuery;
-
-static void context_state_callback(pa_context *context, void *userdata)
-{
-	pa_context_state_t *state = userdata;
-	*state = pa_context_get_state(context);
-}
 
 static void success_callback(pa_context *context, int success, void *userdata)
 {
@@ -38,35 +24,71 @@ static void success_callback(pa_context *context, int success, void *userdata)
 	}
 }
 
-static char *copy_string(const char *source)
+static int poll_with_extra_descriptor(struct pollfd *pulse_fds,
+	unsigned long pulse_fd_count, int timeout, void *userdata)
 {
-	size_t length;
-	char *copy;
+	PulseClient *client = userdata;
+	size_t total_count = (size_t)pulse_fd_count;
+	struct pollfd *larger_buffer;
+	int result;
 
-	if (source == NULL) {
-		return NULL;
+	if (client->extra_poll_fd >= 0) {
+		total_count++;
+	}
+	if (total_count > client->poll_buffer_capacity) {
+		larger_buffer = realloc(client->poll_buffer,
+			total_count * sizeof(*client->poll_buffer));
+		if (larger_buffer == NULL) {
+			return -1;
+		}
+		client->poll_buffer = larger_buffer;
+		client->poll_buffer_capacity = total_count;
 	}
 
-	length = strlen(source) + 1;
-	copy = malloc(length);
-	if (copy != NULL) {
-		memcpy(copy, source, length);
+	/* Preserve PulseAudio's descriptors and append X11 only for this wait. */
+	if (pulse_fd_count > 0) {
+		memcpy(client->poll_buffer, pulse_fds,
+			(size_t)pulse_fd_count * sizeof(*pulse_fds));
 	}
-	return copy;
+	if (client->extra_poll_fd >= 0) {
+		client->poll_buffer[pulse_fd_count] = (struct pollfd){
+			.fd = client->extra_poll_fd,
+			.events = POLLIN,
+		};
+	}
+
+	do {
+		result = poll(client->poll_buffer, total_count, timeout);
+	} while (result < 0 && errno == EINTR);
+	if (result >= 0 && pulse_fd_count > 0) {
+		memcpy(pulse_fds, client->poll_buffer,
+			(size_t)pulse_fd_count * sizeof(*pulse_fds));
+	}
+	return result;
 }
+
+static void sink_info_callback(pa_context *context, const pa_sink_info *info,
+	int end_of_list, void *userdata);
 
 static void server_info_callback(pa_context *context, const pa_server_info *info,
 	void *userdata)
 {
-	ServerQuery *query = userdata;
-	(void)context;
+	PulseClient *client = userdata;
+	pa_operation *operation;
 
 	if (info == NULL || info->default_sink_name == NULL) {
+		client->state = PULSE_CLIENT_FAILED;
 		return;
 	}
 
-	query->name = copy_string(info->default_sink_name);
-	query->received = query->name != NULL;
+	/* Start the dependent sink lookup directly from the server callback. */
+	operation = pa_context_get_sink_info_by_name(context,
+		info->default_sink_name, sink_info_callback, client);
+	if (operation == NULL) {
+		client->state = PULSE_CLIENT_FAILED;
+		return;
+	}
+	pa_operation_unref(operation);
 }
 
 static int volume_as_percent(const pa_cvolume *volume)
@@ -79,22 +101,57 @@ static int volume_as_percent(const pa_cvolume *volume)
 static void sink_info_callback(pa_context *context, const pa_sink_info *info,
 	int end_of_list, void *userdata)
 {
-	SinkQuery *query = userdata;
+	PulseClient *client = userdata;
 
 	if (end_of_list < 0) {
 		fprintf(stderr, "Failed to query the default sink: %s\n",
 			pa_strerror(pa_context_errno(context)));
+		client->state = PULSE_CLIENT_FAILED;
 		return;
 	}
-	if (end_of_list || info == NULL) {
+	if (end_of_list) {
+		client->state = client->startup_sink_found
+			? PULSE_CLIENT_READY : PULSE_CLIENT_FAILED;
+		return;
+	}
+	if (info == NULL) {
 		return;
 	}
 
-	query->device->index = info->index;
-	query->device->volume = info->volume;
-	query->device->volume_percent = volume_as_percent(&info->volume);
-	query->device->muted = info->mute != 0;
-	query->found = true;
+	client->startup_device->index = info->index;
+	client->startup_device->volume = info->volume;
+	client->startup_device->volume_percent = volume_as_percent(&info->volume);
+	client->startup_device->muted = info->mute != 0;
+	client->startup_sink_found = true;
+}
+
+static void context_state_callback(pa_context *context, void *userdata)
+{
+	PulseClient *client = userdata;
+	pa_operation *operation;
+
+	switch (pa_context_get_state(context)) {
+		case PA_CONTEXT_READY:
+			/* Default-sink discovery continues asynchronously on this loop. */
+			operation = pa_context_get_server_info(context,
+				server_info_callback, client);
+			if (operation == NULL) {
+				client->state = PULSE_CLIENT_FAILED;
+				return;
+			}
+			pa_operation_unref(operation);
+			break;
+		case PA_CONTEXT_FAILED:
+			fprintf(stderr, "PulseAudio connection failed: %s\n",
+				pa_strerror(pa_context_errno(context)));
+			client->state = PULSE_CLIENT_FAILED;
+			break;
+		case PA_CONTEXT_TERMINATED:
+			client->state = PULSE_CLIENT_FAILED;
+			break;
+		default:
+			break;
+	}
 }
 
 static bool wait_for_operation(PulseClient *client, pa_operation *operation)
@@ -140,12 +197,16 @@ static pa_cvolume scaled_volume(const PulseDevice *device, long percentage)
 	return volume;
 }
 
-bool pulse_client_init(PulseClient *client, const char *client_name)
+bool pulse_client_start(PulseClient *client, const char *client_name,
+	PulseDevice *device)
 {
-	pa_context_state_t state = PA_CONTEXT_UNCONNECTED;
 	pa_proplist *properties;
 
 	memset(client, 0, sizeof(*client));
+	memset(device, 0, sizeof(*device));
+	client->state = PULSE_CLIENT_STARTING;
+	client->startup_device = device;
+	client->extra_poll_fd = -1;
 	properties = pa_proplist_new();
 	if (properties == NULL) {
 		fprintf(stderr, "Failed to allocate PulseAudio properties\n");
@@ -171,7 +232,11 @@ bool pulse_client_init(PulseClient *client, const char *client_name)
 		return false;
 	}
 
-	pa_context_set_state_callback(client->context, context_state_callback, &state);
+	/* The custom poller lets PulseAudio sleep on X11 without another thread. */
+	pa_mainloop_set_poll_func(client->mainloop,
+		poll_with_extra_descriptor, client);
+	pa_context_set_state_callback(client->context,
+		context_state_callback, client);
 	if (pa_context_connect(client->context, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0) {
 		fprintf(stderr, "Failed to connect to PulseAudio: %s\n",
 			pa_strerror(pa_context_errno(client->context)));
@@ -179,21 +244,7 @@ bool pulse_client_init(PulseClient *client, const char *client_name)
 		return false;
 	}
 
-	while (state != PA_CONTEXT_READY && state != PA_CONTEXT_FAILED
-		&& state != PA_CONTEXT_TERMINATED) {
-		if (pa_mainloop_iterate(client->mainloop, 1, NULL) < 0) {
-			break;
-		}
-	}
-	if (state != PA_CONTEXT_READY) {
-		fprintf(stderr, "Failed to connect to PulseAudio: %s\n",
-			pa_strerror(pa_context_errno(client->context)));
-		pulse_client_cleanup(client);
-		return false;
-	}
-
-	/* The connection state outlives this function, but its stack variable does not. */
-	pa_context_set_state_callback(client->context, NULL, NULL);
+	/* Connection and default-sink discovery progress in the application loop. */
 	return true;
 }
 
@@ -208,27 +259,14 @@ void pulse_client_cleanup(PulseClient *client)
 		pa_mainloop_free(client->mainloop);
 		client->mainloop = NULL;
 	}
+	free(client->poll_buffer);
+	client->poll_buffer = NULL;
+	client->poll_buffer_capacity = 0;
 }
 
-bool pulse_client_get_default_sink(PulseClient *client, PulseDevice *device)
+PulseClientState pulse_client_state(const PulseClient *client)
 {
-	ServerQuery server = {0};
-	SinkQuery sink = {.device = device};
-	bool completed;
-
-	memset(device, 0, sizeof(*device));
-	completed = wait_for_operation(client,
-		pa_context_get_server_info(client->context, server_info_callback, &server));
-	if (!completed || !server.received) {
-		free(server.name);
-		return false;
-	}
-
-	completed = wait_for_operation(client,
-		pa_context_get_sink_info_by_name(
-			client->context, server.name, sink_info_callback, &sink));
-	free(server.name);
-	return completed && sink.found;
+	return client->state;
 }
 
 bool pulse_client_set_mute(PulseClient *client, PulseDevice *device, bool muted)
@@ -283,5 +321,31 @@ bool pulse_client_set_volume_async(PulseClient *client, PulseDevice *device,
 void pulse_client_iterate(PulseClient *client, bool block)
 {
 	int iteration_result;
+
+	client->extra_poll_fd = -1;
 	pa_mainloop_iterate(client->mainloop, block ? 1 : 0, &iteration_result);
+}
+
+bool pulse_client_wait(PulseClient *client, int extra_fd,
+	int timeout_milliseconds)
+{
+	int timeout_microseconds;
+	bool succeeded;
+
+	/* pa_mainloop_prepare() uses microseconds, unlike poll()'s milliseconds. */
+	if (timeout_milliseconds < 0) {
+		timeout_microseconds = -1;
+	} else if (timeout_milliseconds > INT_MAX / 1000) {
+		timeout_microseconds = INT_MAX;
+	} else {
+		timeout_microseconds = timeout_milliseconds * 1000;
+	}
+
+	client->extra_poll_fd = extra_fd;
+	succeeded = pa_mainloop_prepare(client->mainloop,
+		timeout_microseconds) >= 0
+		&& pa_mainloop_poll(client->mainloop) >= 0
+		&& pa_mainloop_dispatch(client->mainloop) >= 0;
+	client->extra_poll_fd = -1;
+	return succeeded;
 }

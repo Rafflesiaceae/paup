@@ -42,11 +42,21 @@ typedef struct {
 	struct timespec next_step;
 } VolumeKeyHold;
 
+typedef enum {
+	TERMINAL_ACTION_NONE,
+	TERMINAL_ACTION_SILENCE,
+	TERMINAL_ACTION_LOUD,
+} TerminalAction;
+
 typedef struct {
 	Connection connection;
 	PulseClient pulse;
 	PulseDevice device;
 	bool pulse_initialized;
+	bool device_ready;
+	int startup_volume_delta;
+	bool startup_mute_toggle;
+	TerminalAction startup_terminal_action;
 	xcb_atom_t active_window_atom;
 	xcb_atom_t instance_atom;
 	xcb_window_t window;
@@ -142,29 +152,43 @@ static bool request_succeeded(Connection *connection, xcb_void_cookie_t cookie,
 	return false;
 }
 
-static xcb_atom_t read_atom(Connection *connection, const char *name)
+static bool read_required_atoms(App *app)
 {
-	xcb_intern_atom_cookie_t cookie;
-	xcb_intern_atom_reply_t *reply;
-	xcb_atom_t atom;
+	static const char active_window_name[] = "_NET_ACTIVE_WINDOW";
+	static const char instance_name[] = "_PAUP_INSTANCE";
+	Connection *connection = &app->connection;
+	xcb_intern_atom_cookie_t active_cookie;
+	xcb_intern_atom_cookie_t instance_cookie;
+	xcb_intern_atom_reply_t *active_reply;
+	xcb_intern_atom_reply_t *instance_reply;
 
-	cookie = xcb_intern_atom(connection->handle, false, strlen(name), name);
-	reply = xcb_intern_atom_reply(connection->handle, cookie, NULL);
-	if (reply == NULL) {
-		debugf("Failed to read X11 atom '%s'\n", name);
-		return XCB_ATOM_NONE;
+	/* Submit both atom requests together so they share one X11 round trip. */
+	active_cookie = xcb_intern_atom(connection->handle, false,
+		sizeof(active_window_name) - 1, active_window_name);
+	instance_cookie = xcb_intern_atom(connection->handle, false,
+		sizeof(instance_name) - 1, instance_name);
+	active_reply = xcb_intern_atom_reply(connection->handle,
+		active_cookie, NULL);
+	instance_reply = xcb_intern_atom_reply(connection->handle,
+		instance_cookie, NULL);
+	if (active_reply == NULL || instance_reply == NULL) {
+		debugf("Failed to read required X11 atoms\n");
+		free(active_reply);
+		free(instance_reply);
+		return false;
 	}
 
-	atom = reply->atom;
-	free(reply);
-	debugf("Read X11 atom '%s' -> %u\n", name, atom);
-	return atom;
+	app->active_window_atom = active_reply->atom;
+	app->instance_atom = instance_reply->atom;
+	free(active_reply);
+	free(instance_reply);
+	return app->active_window_atom != XCB_ATOM_NONE
+		&& app->instance_atom != XCB_ATOM_NONE;
 }
 
 static void grab_key(Connection *connection, xcb_keysym_t keysym)
 {
 	xcb_keycode_t *keycodes;
-	xcb_void_cookie_t cookie;
 
 	keycodes = xcb_key_symbols_get_keycode(connection->symbols, keysym);
 	if (keycodes == NULL || keycodes[0] == XCB_NO_SYMBOL) {
@@ -173,50 +197,74 @@ static void grab_key(Connection *connection, xcb_keysym_t keysym)
 		return;
 	}
 
-	cookie = xcb_grab_key_checked(connection->handle, true,
+	/* Grab failures are reported asynchronously with the other setup errors. */
+	xcb_grab_key(connection->handle, true,
 		connection->screen->root, 0, keycodes[0],
 		XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC);
-	if (request_succeeded(connection, cookie, "Key grab")) {
-		debugf("Grabbed keysym 0x%x as keycode %u\n", keysym, keycodes[0]);
-	}
+	debugf("Requested grab of keysym 0x%x as keycode %u\n",
+		keysym, keycodes[0]);
 	free(keycodes);
 }
 
-static uint32_t get_color_pixel(Connection *connection, uint16_t red,
-	uint16_t green, uint16_t blue)
+static xcb_alloc_color_cookie_t request_color(Connection *connection,
+	uint16_t red, uint16_t green, uint16_t blue)
 {
-	xcb_alloc_color_cookie_t cookie;
-	xcb_alloc_color_reply_t *reply;
-	uint32_t pixel;
-
 	/* X11 accepts 16-bit components, while PAUP's palette uses 8-bit RGB. */
 	red = (uint16_t)(65535U * (red & 0xffU) / 255U);
 	green = (uint16_t)(65535U * (green & 0xffU) / 255U);
 	blue = (uint16_t)(65535U * (blue & 0xffU) / 255U);
-	cookie = xcb_alloc_color(connection->handle,
+	return xcb_alloc_color(connection->handle,
 		connection->screen->default_colormap, red, green, blue);
-	reply = xcb_alloc_color_reply(connection->handle, cookie, NULL);
-	if (reply == NULL) {
-		debugf("Failed to allocate X11 color\n");
-		return UINT32_MAX;
-	}
-
-	pixel = reply->pixel;
-	free(reply);
-	return pixel;
 }
 
-static bool create_graphics_context(App *app, xcb_gcontext_t *context,
+static bool get_palette(App *app, uint32_t *foreground,
+	uint32_t *muted, uint32_t *background)
+{
+	Connection *connection = &app->connection;
+	xcb_alloc_color_cookie_t foreground_cookie;
+	xcb_alloc_color_cookie_t muted_cookie;
+	xcb_alloc_color_cookie_t background_cookie;
+	xcb_alloc_color_reply_t *foreground_reply;
+	xcb_alloc_color_reply_t *muted_reply;
+	xcb_alloc_color_reply_t *background_reply;
+	bool succeeded;
+
+	/* Pipeline the palette lookups instead of waiting for each color in turn. */
+	foreground_cookie = request_color(connection, 0xa6, 0xe2, 0x2e);
+	muted_cookie = request_color(connection, 0xff, 0x45, 0x35);
+	background_cookie = request_color(connection, 0x38, 0x38, 0x30);
+	foreground_reply = xcb_alloc_color_reply(connection->handle,
+		foreground_cookie, NULL);
+	muted_reply = xcb_alloc_color_reply(connection->handle,
+		muted_cookie, NULL);
+	background_reply = xcb_alloc_color_reply(connection->handle,
+		background_cookie, NULL);
+	succeeded = foreground_reply != NULL && muted_reply != NULL
+		&& background_reply != NULL;
+	if (succeeded) {
+		*foreground = foreground_reply->pixel;
+		*muted = muted_reply->pixel;
+		*background = background_reply->pixel;
+	} else {
+		debugf("Failed to allocate the X11 palette\n");
+	}
+
+	free(foreground_reply);
+	free(muted_reply);
+	free(background_reply);
+	return succeeded;
+}
+
+static void create_graphics_context(App *app, xcb_gcontext_t *context,
 	uint32_t pixel)
 {
 	uint32_t values[] = {pixel, false};
 	uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_GRAPHICS_EXPOSURES;
 
 	*context = xcb_generate_id(app->connection.handle);
-	return request_succeeded(&app->connection,
-		xcb_create_gc_checked(app->connection.handle, *context,
-			app->connection.screen->root, mask, values),
-		"Graphics context creation");
+	/* Setup errors arrive through the normal event queue without a sync. */
+	xcb_create_gc(app->connection.handle, *context,
+		app->connection.screen->root, mask, values);
 }
 
 static void focus_popup(Connection *connection, xcb_window_t window)
@@ -382,6 +430,22 @@ static void request_volume_sync(App *app)
 
 static bool adjust_volume(App *app, int delta)
 {
+	if (!app->device_ready) {
+		int pending_delta = app->startup_volume_delta + delta;
+
+		/* Any larger delta is equivalent once the real 0-100 value arrives. */
+		if (pending_delta < -MAX_VOLUME) {
+			pending_delta = -MAX_VOLUME;
+		} else if (pending_delta > MAX_VOLUME) {
+			pending_delta = MAX_VOLUME;
+		}
+		if (pending_delta == app->startup_volume_delta) {
+			return false;
+		}
+		app->startup_volume_delta = pending_delta;
+		return true;
+	}
+
 	int requested_volume = app->volume + delta;
 	int new_volume = requested_volume;
 
@@ -487,18 +551,78 @@ static int volume_hold_timeout_milliseconds(const App *app)
 	return milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
 }
 
-static void do_best_effort_work(App *app)
+static bool finish_pulse_startup(App *app)
 {
+	PulseClientState state;
+	int requested_volume;
+
+	if (app->device_ready) {
+		return true;
+	}
+
+	state = pulse_client_state(&app->pulse);
+	if (state == PULSE_CLIENT_STARTING) {
+		return true;
+	}
+	if (state == PULSE_CLIENT_FAILED) {
+		debugf("PulseAudio startup failed\n");
+		return false;
+	}
+
+	app->device_ready = true;
+	app->volume = app->device.volume_percent;
+	app->muted = app->device.muted;
+	if (app->startup_terminal_action == TERMINAL_ACTION_SILENCE) {
+		app->muted = true;
+		pulse_client_set_mute(&app->pulse, &app->device, true);
+		show_exit_feedback(app);
+		return false;
+	}
+	if (app->startup_terminal_action == TERMINAL_ACTION_LOUD) {
+		app->muted = false;
+		app->volume = MAX_VOLUME;
+		pulse_client_set_mute(&app->pulse, &app->device, false);
+		pulse_client_set_volume(&app->pulse, &app->device, MAX_VOLUME);
+		show_exit_feedback(app);
+		return false;
+	}
+
+	/* Replay input received while the sink state was still being discovered. */
+	requested_volume = app->volume + app->startup_volume_delta;
+	if (requested_volume < 0) {
+		requested_volume = 0;
+	} else if (requested_volume > MAX_VOLUME) {
+		requested_volume = MAX_VOLUME;
+	}
+	if (requested_volume != app->volume) {
+		app->volume = requested_volume;
+		request_volume_sync(app);
+	}
+	if (app->startup_mute_toggle) {
+		app->muted = !app->muted;
+		pulse_client_set_mute(&app->pulse, &app->device, app->muted);
+	}
+	request_draw(app);
+	return true;
+}
+
+static bool do_best_effort_work(App *app)
+{
+	pulse_client_iterate(&app->pulse, false);
+	if (!finish_pulse_startup(app)) {
+		return false;
+	}
+
 	if (app->volume_sync_pending) {
 		app->volume_sync_pending = false;
 		pulse_client_set_volume_async(&app->pulse, &app->device,
 			app->pending_volume);
 	}
 
-	pulse_client_iterate(&app->pulse, false);
 	if (app->redraw_pending) {
 		draw(app);
 	}
+	return true;
 }
 
 static bool handle_event(App *app, xcb_generic_event_t *event)
@@ -571,14 +695,26 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					break;
 				case XK_m:
 					app->muted = !app->muted;
-					pulse_client_set_mute(&app->pulse, &app->device,
-						app->muted);
+					if (app->device_ready) {
+						pulse_client_set_mute(&app->pulse, &app->device,
+							app->muted);
+					} else {
+						app->startup_mute_toggle =
+							!app->startup_mute_toggle;
+					}
 					request_draw(app);
 					break;
 				case XK_s:
 					/* Silence is terminal, so render its known final state. */
 					app->volume_key_hold = (VolumeKeyHold){0};
 					app->muted = true;
+					if (!app->device_ready) {
+						app->volume = MAX_VOLUME;
+						app->startup_terminal_action =
+							TERMINAL_ACTION_SILENCE;
+						request_draw(app);
+						break;
+					}
 					pulse_client_set_mute(&app->pulse, &app->device, true);
 					show_exit_feedback(app);
 					return false;
@@ -587,6 +723,12 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					app->volume_key_hold = (VolumeKeyHold){0};
 					app->muted = false;
 					app->volume = MAX_VOLUME;
+					if (!app->device_ready) {
+						app->startup_terminal_action =
+							TERMINAL_ACTION_LOUD;
+						request_draw(app);
+						break;
+					}
 					pulse_client_set_mute(&app->pulse, &app->device, false);
 					pulse_client_set_volume(&app->pulse, &app->device,
 						MAX_VOLUME);
@@ -639,17 +781,22 @@ static bool run_event_loop(App *app)
 		xcb_generic_event_t *event =
 			xcb_poll_for_event(app->connection.handle);
 		if (event == NULL) {
-			struct pollfd x11_poll = {
-				.fd = xcb_get_file_descriptor(app->connection.handle),
-				.events = POLLIN,
-			};
-
+			/* Defer all audio work until the popup's initial X11 events drain. */
+			if (!app->pulse_initialized) {
+				if (!pulse_client_start(&app->pulse, "paup", &app->device)) {
+					return false;
+				}
+				app->pulse_initialized = true;
+			}
 			advance_volume_hold(app);
-			do_best_effort_work(app);
-			if (poll(&x11_poll, 1,
-				volume_hold_timeout_milliseconds(app)) < 0
-				&& errno != EINTR) {
-				debugf("Failed while polling X11: %s\n", strerror(errno));
+			if (!do_best_effort_work(app)) {
+				return pulse_client_state(&app->pulse)
+					!= PULSE_CLIENT_FAILED;
+			}
+			if (!pulse_client_wait(&app->pulse,
+				xcb_get_file_descriptor(app->connection.handle),
+				volume_hold_timeout_milliseconds(app))) {
+				debugf("Failed while waiting for application events\n");
 				return false;
 			}
 			continue;
@@ -657,9 +804,12 @@ static bool run_event_loop(App *app)
 
 		running = handle_event(app, event);
 		free(event);
-		if (running) {
+		if (running && app->pulse_initialized) {
 			advance_volume_hold(app);
-			do_best_effort_work(app);
+			if (!do_best_effort_work(app)) {
+				return pulse_client_state(&app->pulse)
+					!= PULSE_CLIENT_FAILED;
+			}
 		}
 	}
 
@@ -683,11 +833,7 @@ static InitResult app_init(App *app)
 		return INIT_ERROR;
 	}
 
-	app->active_window_atom = read_atom(&app->connection,
-		"_NET_ACTIVE_WINDOW");
-	app->instance_atom = read_atom(&app->connection, "_PAUP_INSTANCE");
-	if (app->active_window_atom == XCB_ATOM_NONE
-		|| app->instance_atom == XCB_ATOM_NONE) {
+	if (!read_required_atoms(app)) {
 		return INIT_ERROR;
 	}
 
@@ -701,48 +847,23 @@ static InitResult app_init(App *app)
 		return popup_result;
 	}
 
-	if (!pulse_client_init(&app->pulse, "paup")) {
+	if (!get_palette(app, &foreground_pixel, &muted_pixel,
+		&background_pixel)) {
 		return INIT_ERROR;
 	}
-	app->pulse_initialized = true;
-	if (!pulse_client_get_default_sink(&app->pulse, &app->device)) {
-		debugf("Failed to get the default PulseAudio sink\n");
-		return INIT_ERROR;
-	}
-	app->volume = app->device.volume_percent;
-	app->muted = app->device.muted;
-
-	foreground_pixel = get_color_pixel(&app->connection, 0xa6, 0xe2, 0x2e);
-	muted_pixel = get_color_pixel(&app->connection, 0xff, 0x45, 0x35);
-	background_pixel = get_color_pixel(&app->connection, 0x38, 0x38, 0x30);
-	if (foreground_pixel == UINT32_MAX || muted_pixel == UINT32_MAX
-		|| background_pixel == UINT32_MAX) {
-		return INIT_ERROR;
-	}
-	if (!create_graphics_context(app, &app->foreground, foreground_pixel)
-		|| !create_graphics_context(app, &app->foreground_muted, muted_pixel)
-		|| !create_graphics_context(app, &app->background, background_pixel)) {
-		return INIT_ERROR;
-	}
+	create_graphics_context(app, &app->foreground, foreground_pixel);
+	create_graphics_context(app, &app->foreground_muted, muted_pixel);
+	create_graphics_context(app, &app->background, background_pixel);
 
 	app->buffer = xcb_generate_id(app->connection.handle);
-	if (!request_succeeded(&app->connection,
-		xcb_create_pixmap_checked(app->connection.handle,
-			app->connection.screen->root_depth, app->buffer, app->window,
-			BUFFER_SIZE, BUFFER_SIZE), "Pixmap creation")) {
-		return INIT_ERROR;
-	}
-	if (!request_succeeded(&app->connection,
-		xcb_change_window_attributes_checked(app->connection.handle,
-			app->connection.screen->root, XCB_CW_EVENT_MASK,
-			&root_event_mask), "Root event selection")) {
-		return INIT_ERROR;
-	}
-	if (!request_succeeded(&app->connection,
-		xcb_map_window_checked(app->connection.handle, app->window),
-		"Popup mapping")) {
-		return INIT_ERROR;
-	}
+	/* These independent requests are intentionally batched before one flush. */
+	xcb_create_pixmap(app->connection.handle,
+		app->connection.screen->root_depth, app->buffer, app->window,
+		BUFFER_SIZE, BUFFER_SIZE);
+	xcb_change_window_attributes(app->connection.handle,
+		app->connection.screen->root, XCB_CW_EVENT_MASK,
+		&root_event_mask);
+	xcb_map_window(app->connection.handle, app->window);
 	focus_popup(&app->connection, app->window);
 
 	/* Grabs let one focused popup consume its complete command vocabulary. */
