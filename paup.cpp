@@ -19,8 +19,6 @@
 #include <cassert>
 #include <cstdarg>
 #include <cstring>
-#include <chrono>
-#include <thread>
 
 #define XCB_MOD_MASK_SHIFT   1
 #define XCB_MOD_MASK_LOCK    2
@@ -175,39 +173,24 @@ using namespace xcl;
 auto con = Connection({"WM_STATE", "WM_NAME", "_NET_ACTIVE_WINDOW"});
 uint32_t background, foreground, foreground_muted, buffer;
 xcb_window_t subwin;
-static bool used_fallback = false;  // new global
 
 int vol = 0;
 bool muted = false;
 const int MAX_VOL = 100;
+constexpr uint16_t POPUP_WIDTH = 40;
+constexpr uint16_t POPUP_HEIGHT = 130;
+constexpr uint16_t POPUP_MARGIN = 20;
 Device *device;
 ServerInfo defaults;
 const char *opt_device;
 uint32_t col01;
-uint16_t win_width = 40;
-uint16_t win_height = 130;
+uint16_t win_width = POPUP_WIDTH;
+uint16_t win_height = POPUP_HEIGHT;
 bool redraw_pending = false;
 bool volume_sync_pending = false;
 long pending_volume = 0;
 
 PulseClient pulsecl("paup");
-
-// Fetch current window geometry (width, height)
-bool get_window_size(xcb_connection_t *conn, xcb_window_t win, uint16_t &w, uint16_t &h)
-{
-	xcb_get_geometry_cookie_t geom_cookie = xcb_get_geometry(conn, win);
-	xcb_get_geometry_reply_t *geom = xcb_get_geometry_reply(conn, geom_cookie, NULL);
-	if (geom) {
-		w = geom->width;
-		h = geom->height;
-		free(geom);
-		return true;
-	} else {
-		w = 40;
-		h = 130;
-		return false;
-	}
-}
 
 void draw()
 {
@@ -277,30 +260,63 @@ uint32_t get_colorpixel(uint16_t r, uint16_t g, uint16_t b)
 	return pixel;
 }
 
-// --- New code for deferring the initial draw only if fallback is used ---
-void wait_for_valid_window_size_and_draw()
+void focus_popup(xcb_connection_t *conhandle, xcb_window_t popup)
 {
-	const auto conhandle = con.handle();
-	if (used_fallback) {
-		const int max_attempts = 40;  // wait up to ~200ms total (40 x 5ms)
-		int attempts = 0;
-		uint16_t w = 0, h = 0;
-		while (attempts < max_attempts) {
-			bool ok = get_window_size(conhandle, subwin, w, h);
-			if (ok && w > 1 && h > 1 && !(w == 40 && h == 130)) {
-				win_width = w;
-				win_height = h;
-				break;
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(3));
-			xcb_flush(conhandle);
-			attempts++;
-		}
-		debugf("Window size detected after %d attempts: %ux%u\n", attempts, w, h);
-	}
-	draw();
+	// Override-redirect windows are unmanaged, so explicitly raise and focus
+	// the popup instead of asking the window manager to activate it.
+	const uint32_t stack_mode = XCB_STACK_MODE_ABOVE;
+	xcb_configure_window(conhandle, popup, XCB_CONFIG_WINDOW_STACK_MODE, &stack_mode);
+	xcb_set_input_focus(conhandle, XCB_INPUT_FOCUS_POINTER_ROOT, popup, XCB_CURRENT_TIME);
 }
-// --- End new code ---
+
+bool create_popup_or_focus_existing(xcb_connection_t *conhandle, xcb_screen_t *screen, uint32_t windowmask)
+{
+	const xcb_atom_t instance_atom = con.readAtom("_PAUP_INSTANCE");
+
+	// Holding the X server grab makes checking and claiming the selection
+	// atomic, preventing simultaneous launches from mapping two popups.
+	xcb_grab_server(conhandle);
+	const auto owner_cookie = xcb_get_selection_owner(conhandle, instance_atom);
+	auto *owner_reply = xcb_get_selection_owner_reply(conhandle, owner_cookie, NULL);
+	if (!owner_reply) {
+		xcb_ungrab_server(conhandle);
+		xcb_flush(conhandle);
+		throw std::runtime_error("Failed to check for an existing PAUP instance");
+	}
+
+	const xcb_window_t existing_popup = owner_reply->owner;
+	free(owner_reply);
+	if (existing_popup != XCB_NONE) {
+		xcb_ungrab_server(conhandle);
+		focus_popup(conhandle, existing_popup);
+		xcb_flush(conhandle);
+		debugf("Focused existing popup window %u\n", existing_popup);
+		return false;
+	}
+
+	const int16_t popup_x = screen->width_in_pixels > POPUP_WIDTH + POPUP_MARGIN
+		? static_cast<int16_t>(screen->width_in_pixels - POPUP_WIDTH - POPUP_MARGIN)
+		: 0;
+	const int16_t popup_y = POPUP_MARGIN;
+	const uint32_t create_mask = XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
+	const uint32_t create_values[] = {1, windowmask};
+	subwin = xcb_generate_id(conhandle);
+	const auto create_cookie = xcb_create_window_checked(conhandle, XCB_COPY_FROM_PARENT, subwin, screen->root, popup_x, popup_y, POPUP_WIDTH, POPUP_HEIGHT, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, create_mask, create_values);
+	auto *create_error = xcb_request_check(conhandle, create_cookie);
+	if (create_error) {
+		const uint8_t error_code = create_error->error_code;
+		free(create_error);
+		xcb_ungrab_server(conhandle);
+		xcb_flush(conhandle);
+		throw std::runtime_error("Failed to create PAUP popup (X11 error " + std::to_string(error_code) + ")");
+	}
+
+	// The selection belongs to the popup itself, so X11 releases the
+	// single-instance claim automatically when the process disconnects.
+	xcb_set_selection_owner(conhandle, subwin, instance_atom, XCB_CURRENT_TIME);
+	xcb_ungrab_server(conhandle);
+	return true;
+}
 
 void init(int argc, char **argv)
 {
@@ -314,34 +330,12 @@ void init(int argc, char **argv)
 	auto screen = con.screen();
 	auto conhandle = con.handle();
 
-	pulsecl.Populate();
-
-	auto getwin = xcb_get_input_focus(conhandle);
-	auto rep = xcb_get_input_focus_reply(conhandle, getwin, NULL);
-	if (!rep) {
-		debugf("xcb_get_input_focus_reply failed\n");
-		throw std::runtime_error("Failed to get input focus");
-	}
-	auto parent = rep->focus;
-	free(rep);
-
 	uint32_t windowmask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_PROPERTY_CHANGE;
-
-	xcb_window_t overlay_parent = parent;
-	xcb_window_t window_id = xcb_generate_id(conhandle);
-
-	xcb_generic_error_t *err = xcb_request_check(conhandle, xcb_create_window_checked(conhandle, (uint8_t)XCB_COPY_FROM_PARENT, window_id, overlay_parent, (int16_t)20, (int16_t)20, 40, 130, (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, XCB_CW_EVENT_MASK, &windowmask));
-	used_fallback = false;
-	if (err) {
-		debugf("Window creation failed with parent (focus): error_code=%d (falling back to root)\n", err->error_code);
-		free(err);
-
-		overlay_parent = screen->root;
-		window_id = xcb_generate_id(conhandle);
-		xcb_create_window(conhandle, (uint8_t)XCB_COPY_FROM_PARENT, window_id, overlay_parent, (int16_t)20, (int16_t)20, 40, 130, (uint16_t)0, (uint16_t)XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, XCB_CW_EVENT_MASK, &windowmask);
-		used_fallback = true;
+	if (!create_popup_or_focus_existing(conhandle, screen, windowmask)) {
+		return;
 	}
-	subwin = window_id;
+
+	pulsecl.Populate();
 
 	uint32_t values[2];
 	values[1] = 0;
@@ -359,8 +353,7 @@ void init(int argc, char **argv)
 	xcb_create_pixmap_checked(conhandle, screen->root_depth, buffer, subwin, 1024, 1024);
 
 	xcb_map_window(conhandle, subwin);
-
-	xcb_set_input_focus(conhandle, XCB_INPUT_FOCUS_POINTER_ROOT, subwin, XCB_CURRENT_TIME);
+	focus_popup(conhandle, subwin);
 
 	const auto olo = (uint32_t)XCB_EVENT_MASK_PROPERTY_CHANGE;
 	xcb_change_window_attributes_checked(conhandle, screen->root, XCB_CW_EVENT_MASK, &olo);
@@ -385,8 +378,7 @@ void init(int argc, char **argv)
 	vol = device->Volume();
 	muted = device->Muted();
 
-	// Replace original draw() with wait_for_valid_window_size_and_draw()
-	wait_for_valid_window_size_and_draw();
+	draw();
 
 	xcb_generic_event_t *ev;
 	xcb_generic_event_t *queued_ev = nullptr;
