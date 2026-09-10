@@ -774,10 +774,10 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					break;
 				case 'm':
 					toggle_mute(app);
-					if (shift_pressed) {
+					if (!shift_pressed) {
 						break;
 					}
-					/* Lowercase mute is terminal, matching silence and loud. */
+					/* Uppercase mute is terminal, matching silence and loud. */
 					app->volume_key_hold = (VolumeKeyHold){0};
 					if (!app->device_ready) {
 						app->startup_terminal_action =
@@ -1004,8 +1004,8 @@ static void print_help(const char *program_name)
 		"\n"
 		"Keys:\n"
 		"  j / k        Decrease / increase volume\n"
-		"  m            Toggle mute, then exit\n"
-		"  M            Toggle mute and remain open\n"
+		"  m            Toggle mute and remain open\n"
+		"  M            Toggle mute, then exit\n"
 		"  s / l        Silence / set full volume, then exit\n"
 		"  q / Escape   Exit\n",
 		program_name);
