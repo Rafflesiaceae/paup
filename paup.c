@@ -787,6 +787,7 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					show_exit_feedback(app);
 					return false;
 				case 's':
+				case 'h':
 					/* Silence is terminal, so render its known final state. */
 					app->volume_key_hold = (VolumeKeyHold){0};
 					app->muted = true;
