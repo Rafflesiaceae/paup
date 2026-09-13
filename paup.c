@@ -652,7 +652,9 @@ static bool finish_pulse_startup(App *app)
 	}
 	if (app->startup_terminal_action == TERMINAL_ACTION_SILENCE) {
 		app->muted = true;
+		app->volume = 0;
 		pulse_client_set_mute(&app->pulse, &app->device, true);
+		pulse_client_set_volume(&app->pulse, &app->device, 0);
 		show_exit_feedback(app);
 		return false;
 	}
@@ -788,17 +790,18 @@ static bool handle_event(App *app, xcb_generic_event_t *event)
 					return false;
 				case 's':
 				case 'h':
-					/* Silence is terminal, so render its known final state. */
+					/* Silence is terminal and means muted at zero volume. */
 					app->volume_key_hold = (VolumeKeyHold){0};
 					app->muted = true;
+					app->volume = 0;
 					if (!app->device_ready) {
-						app->volume = MAX_VOLUME;
 						app->startup_terminal_action =
 							TERMINAL_ACTION_SILENCE;
 						request_draw(app);
 						break;
 					}
 					pulse_client_set_mute(&app->pulse, &app->device, true);
+					pulse_client_set_volume(&app->pulse, &app->device, 0);
 					show_exit_feedback(app);
 					return false;
 				case 'l':
